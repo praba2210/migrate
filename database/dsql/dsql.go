@@ -339,10 +339,30 @@ func parseConfig(purl *nurl.URL) (*Config, error) {
 // them. Same reasoning as ErrPasswordSet: an operator who sets one of these has an
 // expectation, and silently discarding it is worse than refusing to start.
 func rejectIgnoredOptions(query nurl.Values) error {
-	// The connector replaces ConnConfig.RuntimeParams wholesale, so a search_path in the
-	// URL never reaches the server. Schema qualification is the supported route.
-	if query.Has("search_path") {
-		return errors.New("search_path is not supported, the connector discards it; use x-migrations-schema")
+	// The connector replaces ConnConfig.RuntimeParams wholesale, and pgx stores both
+	// search_path and options=-c search_path=... in that map, so neither reaches the server.
+	// Both are rejected rather than ignored, so they cannot be believed, and rejected rather
+	// than applied, so applying them later stays open: turning this error into working
+	// behavior breaks nobody, while ignoring them now and applying them later would change
+	// what existing URLs do with no way to warn. Deliberately not redirected to
+	// x-migrations-schema, which places this driver's own two tables and leaves migration
+	// SQL where it is.
+	//
+	// The options form matters because it is what the Aurora DSQL ORM integrations tell
+	// users to write; it works for their raw clients, which do not go through this connector.
+	//
+	// TODO: decide whether Open should apply search_path via pgxpool's AfterConnect, which
+	// the connector leaves alone. postgres and pgx both document search_path as a URL
+	// parameter, so this is the one place a dsql:// URL is not a drop-in for theirs. It
+	// would also make CURRENT_SCHEMA() resolve on its own, leaving x-migrations-schema
+	// optional rather than the only way in. It cannot cover WithInstance, whose caller owns
+	// the pool, but neither can the postgres drivers'.
+	for _, key := range []string{"search_path", "options"} {
+		if query.Has(key) {
+			return fmt.Errorf("%s is not supported: the connector replaces RuntimeParams, so it never reaches the server. "+
+				"Schema-qualify your migration SQL instead, for example CREATE TABLE app.users. "+
+				"x-migrations-schema places this driver's own tables and does not affect your statements", key)
+		}
 	}
 	// postgres can place the migrations table in a schema other than the working one, which
 	// this driver cannot express: x-migrations-schema moves both of its tables together.

@@ -65,15 +65,28 @@ GRANT USAGE, CREATE ON SCHEMA app TO migrator;
 Then migrate with `x-migrations-schema=app`. `sys.iam_pg_role_mappings` lists the
 IAM-to-role mappings if a connection is refused. Because the role's schema is not implied by
 its name, `x-migrations-schema` is how this driver learns where to put the migrations and
-lock tables. It moves only those two tables; it does not change where your migration SQL
-puts things.
+lock tables.
 
-This driver schema-qualifies both of its tables rather than setting `search_path`. Either
-works for `dsql://` URLs, because pgxpool's per-connection hooks run before a connection
-joins the pool and the connector chains rather than replaces `BeforeConnect`. Only
-qualifying also covers `WithInstance`, where the caller supplies a pool this driver never
-configures. A `search_path` in the URL is a different matter and is rejected: the connector
-replaces `ConnConfig.RuntimeParams` wholesale, so it would never reach the server.
+It places those two tables and nothing else. Where your own objects land is decided by your
+SQL, so qualify it:
+
+```sql
+CREATE TABLE app.users (id UUID PRIMARY KEY);   -- lands in app
+CREATE TABLE users (id UUID PRIMARY KEY);       -- lands wherever search_path points
+```
+
+The migrations under `examples/` use bare names, as the other drivers' examples do, so add
+the prefix when migrating as a custom role.
+
+`search_path` cannot do this job here. Both `?search_path=app` and
+`?options=-c search_path=app` are stored in pgx's `RuntimeParams`, which the connector
+replaces wholesale, so neither reaches the server; the driver rejects them rather than let
+them look effective. A library caller who wants `search_path` can set it in their own pool's
+`AfterConnect`, which the connector leaves alone, and pass that pool to `WithInstance`.
+
+That is also why the driver qualifies its own two tables rather than relying on a session
+setting: a pool hook covers the `dsql://` path, but only qualifying covers `WithInstance`,
+where the caller supplies a pool this driver never configures.
 
 ## Writing migrations for DSQL
 

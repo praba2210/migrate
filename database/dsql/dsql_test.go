@@ -133,7 +133,10 @@ func TestParseConfigRejectsBadOptions(t *testing.T) {
 		{"negative occ retry delay", "x-occ-max-retry-delay=-1", "x-occ-max-retry-delay"},
 
 		// Silently ignored is worse than refused: the operator believes the setting took.
+		// Both spellings land in pgx's RuntimeParams, which the connector replaces, and the
+		// options form is the one the Aurora DSQL ORM integrations tell users to write.
 		{"search_path", "search_path=app", "search_path"},
+		{"options search_path", "options=-c%20search_path%3Dapp", "options"},
 		{"migrations table quoted", "x-migrations-table-quoted=true", "x-migrations-table-quoted"},
 	}
 
