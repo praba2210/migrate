@@ -13,11 +13,14 @@
 // either, so that is a constraint on how migrations are written rather than a difference
 // in the driver. See the README.
 //
-// Every table this driver touches is schema-qualified from x-migrations-schema or
-// CURRENT_SCHEMA(). Setting search_path would also work for the Open path, since pgxpool
-// runs its per-connection hooks before a connection joins the pool, but it cannot cover
-// WithInstance, whose caller supplies a pool this driver never configures. Qualifying
-// covers both entry points and matches what the postgres and pgx drivers do.
+// This driver's own two tables are schema-qualified from x-migrations-schema or
+// CURRENT_SCHEMA(), which covers WithInstance too, whose caller supplies a pool this driver
+// never configures. Open additionally honors search_path from the URL, as the postgres and
+// pgx drivers do; it takes a pool hook to get there, because the connector replaces
+// ConnConfig.RuntimeParams while building the pool. See poolConfigFor. Measured against a
+// live cluster: a search_path from the URL then takes effect and CURRENT_SCHEMA() resolves
+// from it, which leaves x-migrations-schema an override rather than the only way for a
+// non-admin role to place the two tables.
 //
 // IAM authentication and optimistic-concurrency retry are delegated to the AWS connector
 // (github.com/awslabs/aurora-dsql-connectors/go/pgx) rather than reimplemented here.
@@ -53,7 +56,9 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -133,13 +138,6 @@ type Config struct {
 	// "unset" and takes the connector's 5s. See occConfig.
 	OCCMaxRetries    int
 	OCCMaxRetryDelay time.Duration
-
-	// AwaitAsyncDDL blocks a migration on the asynchronous jobs its DDL enqueues, instead
-	// of returning as soon as they are accepted. It covers every statement that returns a
-	// job_id, not just index builds: ALTER TABLE ASYNC ... VALIDATE CONSTRAINT is the only
-	// way to add a validated foreign key or check constraint on DSQL, and wants the same
-	// wait. Off by default.
-	AwaitAsyncDDL bool
 
 	// An unexported field forces composite literals outside this package to be keyed, so a
 	// field can be added later without breaking callers. Zero width.
@@ -233,9 +231,14 @@ func (d *DSQL) Open(rawURL string) (database.Driver, error) {
 		return nil, err
 	}
 
+	poolConfig, err := poolConfigFor(purl.Query().Get("search_path"))
+	if err != nil {
+		return nil, err
+	}
+
 	// FilterCustomQuery strips only x-*, so region, profile and tokenDurationSecs
 	// survive for the connector to parse itself.
-	pool, err := awsdsql.NewPool(context.Background(), migrate.FilterCustomQuery(purl).String())
+	pool, err := awsdsql.NewPool(context.Background(), migrate.FilterCustomQuery(purl).String(), poolConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -250,6 +253,73 @@ func (d *DSQL) Open(rawURL string) (database.Driver, error) {
 		return nil, errors.Join(err, closeErr)
 	}
 	return driver, nil
+}
+
+// poolConfigFor builds the pool configuration Open hands the connector.
+//
+// It exists for search_path. pgx keeps a search_path from the URL in
+// ConnConfig.RuntimeParams, and the connector assigns that field a fresh map holding only
+// its own application_name while building the pool, so the value never reaches the server
+// on its own. Setting it from AfterConnect instead lands after the connector is finished,
+// and pgxpool runs the hook before the connection joins the pool, so every connection a
+// migration can be handed already has the schema set. This is also what the connector's own
+// preferred example does (example/src/example_preferred.go), which hardcodes one schema
+// where this takes whatever the operator wrote.
+//
+// Only search_path is carried over. rejectIgnoredOptions refuses the options spelling of it
+// rather than parsing it, and any other PostgreSQL parameter in the URL stays as it was
+// before this hook existed: the connector drops it.
+//
+// Passing a pool config at all costs the connector's lifetime defaults, so both are pinned
+// back to its values. It fills MaxConnLifetime and MaxConnIdleTime only when they are zero,
+// and pgxpool.ParseConfig has already set 1h and 30m — an hour being exactly when DSQL
+// closes a connection server-side, which would leave the pool handing out connections the
+// server is about to drop. The connector's own example has that bug.
+func poolConfigFor(searchPath string) (*pgxpool.Config, error) {
+	poolConfig, err := pgxpool.ParseConfig("")
+	if err != nil {
+		return nil, err
+	}
+
+	poolConfig.MaxConnLifetime = awsdsql.DefaultMaxConnLifetime
+	poolConfig.MaxConnIdleTime = awsdsql.DefaultMaxConnIdleTime
+
+	if statement := setSearchPathStatement(searchPath); statement != "" {
+		poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+			if _, err := conn.Exec(ctx, statement); err != nil {
+				return fmt.Errorf("dsql: setting search_path to %q: %w", searchPath, err)
+			}
+			return nil
+		}
+	}
+
+	return poolConfig, nil
+}
+
+// setSearchPathStatement renders the SET that applies searchPath, or "" if there is nothing
+// to set. A search_path is a comma-separated list, so each element is quoted on its own:
+// quoting the whole value would name one schema containing commas. Empty elements are
+// dropped, because a trailing comma renders as "" and the server rejects that.
+//
+// The value is an operator-supplied string that becomes SQL, hence the quoting rather than
+// a bound parameter — SET takes none. Quoting also settles the case: an element keeps the
+// case it was written in, where postgres and pgx send search_path in the startup packet and
+// the server folds an unquoted element to lower case. Lowercase names, which is what the
+// spelling in every example here is, land the same either way.
+//
+// Measured against a live cluster: single schemas, the list form, surrounding whitespace and
+// "$user" all apply, and a schema that does not exist is accepted silently, as in PostgreSQL.
+func setSearchPathStatement(searchPath string) string {
+	quoted := make([]string, 0, 2)
+	for _, element := range strings.Split(searchPath, ",") {
+		if element = strings.TrimSpace(element); element != "" {
+			quoted = append(quoted, quoteIdentifier(element))
+		}
+	}
+	if len(quoted) == 0 {
+		return ""
+	}
+	return "SET search_path = " + strings.Join(quoted, ", ")
 }
 
 // parseConfig reads the driver's options from the URL. All configuration comes from the
@@ -315,11 +385,6 @@ func parseConfig(purl *nurl.URL) (*Config, error) {
 		return nil, err
 	}
 
-	awaitAsyncDDL, err := parseBool(query, "x-await-async-ddl")
-	if err != nil {
-		return nil, err
-	}
-
 	return &Config{
 		DatabaseName:          strings.TrimPrefix(purl.Path, "/"),
 		SchemaName:            query.Get("x-migrations-schema"),
@@ -331,7 +396,6 @@ func parseConfig(purl *nurl.URL) (*Config, error) {
 		MultiStatementMaxSize: multiStatementMaxSize,
 		OCCMaxRetries:         occMaxRetries,
 		OCCMaxRetryDelay:      time.Duration(occMaxRetryDelay) * time.Millisecond,
-		AwaitAsyncDDL:         awaitAsyncDDL,
 	}, nil
 }
 
@@ -339,30 +403,18 @@ func parseConfig(purl *nurl.URL) (*Config, error) {
 // them. Same reasoning as ErrPasswordSet: an operator who sets one of these has an
 // expectation, and silently discarding it is worse than refusing to start.
 func rejectIgnoredOptions(query nurl.Values) error {
-	// The connector replaces ConnConfig.RuntimeParams wholesale, and pgx stores both
-	// search_path and options=-c search_path=... in that map, so neither reaches the server.
-	// Both are rejected rather than ignored, so they cannot be believed, and rejected rather
-	// than applied, so applying them later stays open: turning this error into working
-	// behavior breaks nobody, while ignoring them now and applying them later would change
-	// what existing URLs do with no way to warn. Deliberately not redirected to
-	// x-migrations-schema, which places this driver's own two tables and leaves migration
-	// SQL where it is.
-	//
-	// The options form matters because it is what the Aurora DSQL ORM integrations tell
-	// users to write; it works for their raw clients, which do not go through this connector.
-	//
-	// TODO: decide whether Open should apply search_path via pgxpool's AfterConnect, which
-	// the connector leaves alone. postgres and pgx both document search_path as a URL
-	// parameter, so this is the one place a dsql:// URL is not a drop-in for theirs. It
-	// would also make CURRENT_SCHEMA() resolve on its own, leaving x-migrations-schema
-	// optional rather than the only way in. It cannot cover WithInstance, whose caller owns
-	// the pool, but neither can the postgres drivers'.
-	for _, key := range []string{"search_path", "options"} {
-		if query.Has(key) {
-			return fmt.Errorf("%s is not supported: the connector replaces RuntimeParams, so it never reaches the server. "+
-				"Schema-qualify your migration SQL instead, for example CREATE TABLE app.users. "+
-				"x-migrations-schema places this driver's own tables and does not affect your statements", key)
-		}
+	// search_path is honored by Open, via poolConfigFor. The options spelling of it is not:
+	// the connector replaces ConnConfig.RuntimeParams, where pgx keeps it, so it never
+	// reaches the server, and it carries arbitrary -c flags this driver would have to parse
+	// and then apply one at a time. Applying only the search_path out of an options string
+	// and dropping whatever else it held would be worse than refusing it. Rejected rather
+	// than ignored for the same reason as ErrPasswordSet: an operator who wrote it has an
+	// expectation. It is worth naming the supported spelling, because the options form is
+	// what the Aurora DSQL ORM integrations tell users to write; it works for their raw
+	// clients, which do not go through this connector.
+	if query.Has("options") {
+		return errors.New("options is not supported: the connector replaces RuntimeParams, so it never reaches the server. " +
+			"Write search_path=app instead of options=-c search_path=app, which Open applies to every connection")
 	}
 	// postgres can place the migrations table in a schema other than the working one, which
 	// this driver cannot express: x-migrations-schema moves both of its tables together.
@@ -513,21 +565,24 @@ func (d *DSQL) runStatement(ctx context.Context, statement []byte) error {
 	// Then branch before executing, because a statement that enqueues an asynchronous job
 	// needs a different pgx call from one that does not:
 	//
-	//   - config.AwaitAsyncDDL, and the statement returns a job_id (CREATE [UNIQUE] INDEX
-	//     ... ASYNC today, and ALTER TABLE ASYNC ... VALIDATE CONSTRAINT, which is the only
-	//     way to add a validated FK or CHECK on DSQL): QueryContext and scan the job_id row,
-	//     then awaitAsyncJob. ExecContext cannot be used, because stdlib returns
-	//     driver.RowsAffected, an int64, so the row is discarded before a sql.Result
-	//     exists. Match with comments stripped first, so a comment cannot hide the
-	//     keywords, and fail loudly if a statement matched but no job_id came back rather
-	//     than reporting a job that was never waited on.
+	//   - the statement returns a job_id (CREATE [UNIQUE] INDEX ... ASYNC today, and ALTER
+	//     TABLE ASYNC ... VALIDATE CONSTRAINT, which is the only way to add a validated FK
+	//     or CHECK on DSQL): QueryContext and scan the job_id row, then awaitAsyncJob.
+	//     ExecContext cannot be used, because stdlib returns driver.RowsAffected, an int64,
+	//     so the row is discarded before a sql.Result exists. Match with comments stripped
+	//     first, so a comment cannot hide the keywords, and fail loudly if a statement
+	//     matched but no job_id came back rather than reporting a job that was never waited
+	//     on.
 	//   - otherwise: ExecContext.
 	//
-	// Two things about the option are still open, and a live run should settle them before
-	// it is relied on: whether a bool is enough, given sys.wait_for_job blocks against a
-	// hard 60-minute connection cap and a duration would bound that, and whether off is the
-	// right default, given a failed build leaves an INVALID index that still enforces
-	// uniqueness until someone drops it.
+	// Always wait, so there is no setting for it: Run returns once the job is finished, which
+	// is what lets the version migrate then marks clean describe the schema it actually has.
+	// Run returning is migrate's signal that the migration applied — it clears the dirty flag
+	// immediately afterwards, with nothing in between (migrate.go, Run then
+	// SetVersion(target, false)). Waiting is also what surfaces a build that failed, while
+	// sys.jobs still holds it: those rows live 30 minutes past a terminal state, and a failed
+	// CREATE INDEX ASYNC leaves an INVALID index that goes on enforcing uniqueness until it
+	// is dropped.
 	//
 	// Return the *pgconn.PgError as-is. The caller turns it into a database.Error with the
 	// failing line, porting computeLineFromPos from database/pgx/v5/pgx.go:304-316.

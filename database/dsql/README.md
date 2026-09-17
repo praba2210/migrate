@@ -46,7 +46,10 @@ Driver options:
 | `x-multi-statement-max-size` | `MultiStatementMaxSize` | 10 MB | Parser buffer limit for the above |
 | `x-occ-max-retries` | `OCCMaxRetries` | `0` | Retries of a statement that hits an OCC conflict. Retry is opt-in; see below |
 | `x-occ-max-retry-delay` | `OCCMaxRetryDelay` | `5000` | Bound on the backoff between retries, in milliseconds. Jitter can add up to a further 25% |
-| `x-await-async-ddl` | `AwaitAsyncDDL` | `false` | Block until the asynchronous jobs a migration enqueues finish |
+
+`search_path` is honored on the `dsql://` path, as it is by the `postgres` and `pgx`
+drivers. `options=-c search_path=app` is rejected: it never reaches the server, and the
+error names `search_path=app` as the spelling that works.
 
 ## Permissions
 
@@ -78,15 +81,18 @@ CREATE TABLE users (id UUID PRIMARY KEY);       -- lands wherever search_path po
 The migrations under `examples/` use bare names, as the other drivers' examples do, so add
 the prefix when migrating as a custom role.
 
-`search_path` cannot do this job here. Both `?search_path=app` and
-`?options=-c search_path=app` are stored in pgx's `RuntimeParams`, which the connector
-replaces wholesale, so neither reaches the server; the driver rejects them rather than let
-them look effective. A library caller who wants `search_path` can set it in their own pool's
-`AfterConnect`, which the connector leaves alone, and pass that pool to `WithInstance`.
+`?search_path=app` does the same job for unqualified SQL as it does with the `postgres` and
+`pgx` drivers, and also makes `CURRENT_SCHEMA()` resolve to `app`, so `x-migrations-schema`
+becomes an override rather than a requirement. It needs a pool hook to get there: pgx keeps
+`search_path` in `RuntimeParams`, which the connector replaces wholesale while building the
+pool, so `Open` applies it from `AfterConnect` instead — the same hook the connector's own
+preferred example uses. `?options=-c search_path=app` is rejected rather than parsed, since
+it can carry other `-c` flags this driver would then have to honor one at a time.
 
-That is also why the driver qualifies its own two tables rather than relying on a session
-setting: a pool hook covers the `dsql://` path, but only qualifying covers `WithInstance`,
-where the caller supplies a pool this driver never configures.
+`WithInstance` is unaffected either way, because its caller supplies the pool. A library
+caller who wants `search_path` sets it in their own pool's `AfterConnect`. That is why the
+driver still qualifies its own two tables rather than relying on the session setting: the
+hook covers the `dsql://` path, but only qualifying covers both.
 
 ## Writing migrations for DSQL
 
@@ -159,14 +165,13 @@ It will not flag a file with several DDL statements unless the file has an expli
 against an index that is not ready, and a failed build leaves an `INVALID` index behind that
 has to be dropped by hand. `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` behaves the same way.
 
-`x-await-async-ddl=true` blocks the migration on those jobs and fails it if one did not
-succeed. It is off by default: fire-and-forget is fine for a pure performance index, and
-the wait only earns its cost when a later step depends on the result.
+The driver waits for those jobs and reports which one failed, so a migration is recorded as
+applied once its index is built and its constraints are validated. Migrate clears the dirty
+flag as soon as `Run` returns, so the wait is what keeps the version history matching the
+schema. AWS recommends it for schema migrations for the same reason.
 
-Two things about the option are still open until it has run against a real cluster: whether
-a bool is enough, since `sys.wait_for_job` blocks against the 60-minute connection cap and
-a duration would bound that, and whether off is the right default, since a failed unique
-index keeps enforcing uniqueness on writes until someone drops it.
+The wait costs migration time on a large index build, against the 60-minute connection limit
+above, which is worth planning for on a big table.
 
 ## Usage as a library
 

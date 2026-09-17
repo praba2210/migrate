@@ -58,24 +58,23 @@ func TestIntegrationLockIsExclusive(t *testing.T) {
 	// Cover both losing shapes, since DSQL adjudicates at COMMIT: a migrator that starts
 	// concurrently commits 40001, and one that starts after the winner committed sees the
 	// row and gets 23505. Both have to reach the caller as database.ErrLocked, including
-	// with x-no-occ-retry set.
+	// with retry off, which is x-occ-max-retries=0 and the default.
 	t.Skip("pending: Lock is not implemented yet")
 }
 
 func TestIntegrationOCCRetry(t *testing.T) {
-	// TODO: drive concurrent writers into a real OC000 and assert the retry wrapper
-	// recovers rather than surfacing the conflict, then that x-no-occ-retry surfaces it.
+	// TODO: with x-occ-max-retries set, drive concurrent writers into a real OC000 and
+	// assert the retry wrapper recovers rather than surfacing the conflict, then that the
+	// default of 0 surfaces it.
 	t.Skip("pending: the retried operations are not implemented yet")
 }
 
 func TestIntegrationAsyncDDL(t *testing.T) {
-	// TODO: with x-await-async-ddl, a CREATE INDEX ASYNC migration must not return until
-	// the build finishes, and a build that fails must fail the migration. Without it, the
-	// migration returns as soon as the job is enqueued. Cover ALTER TABLE ASYNC ...
-	// VALIDATE CONSTRAINT the same way.
+	// TODO: a CREATE INDEX ASYNC migration returns only once the build has finished, and a
+	// failed build fails the migration. Cover ALTER TABLE ASYNC ... VALIDATE CONSTRAINT
+	// the same way. The wait is unconditional, so there is no opt-out to cover.
 	//
-	// This is also what settles the two open questions on the option: how long
-	// sys.wait_for_job actually blocks against the 60-minute connection cap, and what a
-	// failed job looks like from sys.jobs. See runStatement.
+	// This is also what measures how long sys.wait_for_job blocks against the 60-minute
+	// connection cap, and what a failed job looks like from sys.jobs. See runStatement.
 	t.Skip("pending: Run is not implemented yet")
 }

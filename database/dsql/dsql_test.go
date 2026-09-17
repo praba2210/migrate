@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	awsdsql "github.com/awslabs/aurora-dsql-connectors/go/pgx/dsql"
 	"github.com/awslabs/aurora-dsql-connectors/go/pgx/occretry"
 	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/jackc/pgerrcode"
@@ -54,9 +55,6 @@ func TestParseConfigDefaults(t *testing.T) {
 	if config.MultiStatementEnabled {
 		t.Error("MultiStatementEnabled = true, want false")
 	}
-	if config.AwaitAsyncDDL {
-		t.Error("AwaitAsyncDDL = true, want false")
-	}
 	if config.StatementTimeout != 0 {
 		t.Errorf("StatementTimeout = %v, want 0", config.StatementTimeout)
 	}
@@ -77,7 +75,10 @@ func TestParseConfigAllOptions(t *testing.T) {
 		"x-migrations-schema=app&x-migrations-table=mt&x-lock-table=lt&x-force-lock=true&"+
 		"x-statement-timeout=250&"+
 		"x-multi-statement=true&x-multi-statement-max-size=4096&"+
-		"x-occ-max-retries=7&x-occ-max-retry-delay=1500&x-await-async-ddl=true")
+		"x-occ-max-retries=7&x-occ-max-retry-delay=1500&search_path=app")
+
+	// search_path has no Config field: Open applies it to the pool, so all this pins is
+	// that parseConfig accepts it. It used to be rejected.
 
 	if config.DatabaseName != "mydb" {
 		t.Errorf("DatabaseName = %q, want mydb", config.DatabaseName)
@@ -109,9 +110,6 @@ func TestParseConfigAllOptions(t *testing.T) {
 	if config.OCCMaxRetryDelay != 1500*time.Millisecond {
 		t.Errorf("OCCMaxRetryDelay = %v, want 1.5s", config.OCCMaxRetryDelay)
 	}
-	if !config.AwaitAsyncDDL {
-		t.Error("AwaitAsyncDDL = false, want true")
-	}
 }
 
 // A malformed option must fail loudly rather than fall back to a default, per
@@ -128,15 +126,14 @@ func TestParseConfigRejectsBadOptions(t *testing.T) {
 		{"occ max retry delay", "x-occ-max-retry-delay=later", "x-occ-max-retry-delay"},
 		{"force lock", "x-force-lock=maybe", "x-force-lock"},
 		{"multi statement", "x-multi-statement=maybe", "x-multi-statement"},
-		{"await async ddl", "x-await-async-ddl=maybe", "x-await-async-ddl"},
 		{"negative occ retries", "x-occ-max-retries=-1", "x-occ-max-retries"},
 		{"negative occ retry delay", "x-occ-max-retry-delay=-1", "x-occ-max-retry-delay"},
 
 		// Silently ignored is worse than refused: the operator believes the setting took.
-		// Both spellings land in pgx's RuntimeParams, which the connector replaces, and the
-		// options form is the one the Aurora DSQL ORM integrations tell users to write.
-		{"search_path", "search_path=app", "search_path"},
-		{"options search_path", "options=-c%20search_path%3Dapp", "options"},
+		// This spelling lands in pgx's RuntimeParams, which the connector replaces, and it
+		// is the one the Aurora DSQL ORM integrations tell users to write, so the error has
+		// to name the spelling that does work.
+		{"options search_path", "options=-c%20search_path%3Dapp", "search_path=app"},
 		{"migrations table quoted", "x-migrations-table-quoted=true", "x-migrations-table-quoted"},
 	}
 
@@ -343,6 +340,66 @@ func TestDatabaseErrorHidesItsCause(t *testing.T) {
 	}
 }
 
+// A search_path is a list, so each element is quoted separately: quoting the whole value
+// would name a single schema containing commas, which silently resolves to nothing.
+// Verified against a live cluster — every form below applies, and "$user" round-trips as the
+// value DSQL reports by default.
+func TestSetSearchPathStatement(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{",", ""},
+		{"app", `SET search_path = "app"`},
+		{"app, public", `SET search_path = "app", "public"`},
+		{" app , public ", `SET search_path = "app", "public"`},
+		{"app,,public", `SET search_path = "app", "public"`},
+		{"$user, public", `SET search_path = "$user", "public"`},
+		{`we"ird`, `SET search_path = "we""ird"`},
+	}
+
+	for _, test := range tests {
+		if got := setSearchPathStatement(test.in); got != test.want {
+			t.Errorf("setSearchPathStatement(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
+
+// Supplying a pool config turns off the connector's own defaults: it fills the two lifetimes
+// only when they are zero, and pgxpool.ParseConfig has already set them to 1h and 30m. An
+// hour is exactly when DSQL closes a connection server-side, so leaving them would hand out
+// connections the server is about to drop. Asserted because nothing else would notice: the
+// pool still works, it just stops recycling ahead of the server.
+func TestPoolConfigPinsConnectorLifetimes(t *testing.T) {
+	poolConfig, err := poolConfigFor("")
+	if err != nil {
+		t.Fatalf("poolConfigFor: %v", err)
+	}
+
+	if poolConfig.MaxConnLifetime != awsdsql.DefaultMaxConnLifetime {
+		t.Errorf("MaxConnLifetime = %v, want the connector's %v",
+			poolConfig.MaxConnLifetime, awsdsql.DefaultMaxConnLifetime)
+	}
+	if poolConfig.MaxConnIdleTime != awsdsql.DefaultMaxConnIdleTime {
+		t.Errorf("MaxConnIdleTime = %v, want the connector's %v",
+			poolConfig.MaxConnIdleTime, awsdsql.DefaultMaxConnIdleTime)
+	}
+
+	// No search_path means no hook at all, rather than one issuing an empty SET.
+	if poolConfig.AfterConnect != nil {
+		t.Error("AfterConnect is set with no search_path in the URL")
+	}
+
+	withSearchPath, err := poolConfigFor("app")
+	if err != nil {
+		t.Fatalf("poolConfigFor: %v", err)
+	}
+	if withSearchPath.AfterConnect == nil {
+		t.Error("AfterConnect is nil, so search_path would never reach the server")
+	}
+}
+
 func TestQuoteIdentifier(t *testing.T) {
 	tests := []struct {
 		in, want string
@@ -367,8 +424,9 @@ func TestQualifiedTable(t *testing.T) {
 		t.Errorf("qualifiedTable = %s, want %s", got, want)
 	}
 
-	// x-migrations-schema is how a non-admin principal's schema is reached. search_path
-	// would work for Open, but not for WithInstance, whose caller supplies the pool.
+	// Qualifying is what covers WithInstance, whose caller supplies the pool: search_path
+	// is applied by Open only. x-migrations-schema overrides whatever the connection
+	// resolves to, and places this driver's own two tables.
 	nonAdmin := &DSQL{config: mustParseConfig(t, "dsql://app_user@host/postgres?x-migrations-schema=app")}
 	if got, want := nonAdmin.qualifiedTable("schema_migrations"), `"app"."schema_migrations"`; got != want {
 		t.Errorf("qualifiedTable with x-migrations-schema = %s, want %s", got, want)
