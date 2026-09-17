@@ -48,8 +48,8 @@ Driver options:
 | `x-occ-max-retry-delay` | `OCCMaxRetryDelay` | `5000` | Bound on the backoff between retries, in milliseconds. Jitter can add up to a further 25% |
 
 `search_path` is honored on the `dsql://` path, as it is by the `postgres` and `pgx`
-drivers. `options=-c search_path=app` is rejected: it never reaches the server, and the
-error names `search_path=app` as the spelling that works.
+drivers. `options=-c search_path=app` is rejected: it carries arbitrary `-c` flags alongside,
+and the error names `search_path=app` as the spelling this driver applies.
 
 ## Permissions
 
@@ -85,12 +85,13 @@ the prefix when migrating as a custom role.
 `pgx` drivers, and also makes `CURRENT_SCHEMA()` resolve to `app`, so `x-migrations-schema`
 becomes an override rather than a requirement. It needs a pool hook to get there: pgx keeps
 `search_path` in `RuntimeParams`, which the connector replaces wholesale while building the
-pool, so `Open` applies it from `AfterConnect` instead — the same hook the connector's own
-preferred example uses. `?options=-c search_path=app` is rejected rather than parsed, since
-it can carry other `-c` flags this driver would then have to honor one at a time.
+pool, so `Open` puts the value back from `BeforeConnect`, which the connector chains. The
+value is passed through untouched, so the server parses it exactly as it would through
+`postgres` or `pgx`. `?options=-c search_path=app` is rejected rather than parsed, since it
+can carry other `-c` flags this driver would then have to honor one at a time.
 
 `WithInstance` is unaffected either way, because its caller supplies the pool. A library
-caller who wants `search_path` sets it in their own pool's `AfterConnect`. That is why the
+caller who wants `search_path` sets it in their own pool's config. That is why the
 driver still qualifies its own two tables rather than relying on the session setting: the
 hook covers the `dsql://` path, but only qualifying covers both.
 

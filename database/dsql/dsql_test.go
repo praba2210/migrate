@@ -130,9 +130,9 @@ func TestParseConfigRejectsBadOptions(t *testing.T) {
 		{"negative occ retry delay", "x-occ-max-retry-delay=-1", "x-occ-max-retry-delay"},
 
 		// Silently ignored is worse than refused: the operator believes the setting took.
-		// This spelling lands in pgx's RuntimeParams, which the connector replaces, and it
-		// is the one the Aurora DSQL ORM integrations tell users to write, so the error has
-		// to name the spelling that does work.
+		// This spelling carries arbitrary -c flags alongside the schema list, and it is the
+		// one the Aurora DSQL ORM integrations tell users to write, so the error names the
+		// spelling this driver applies.
 		{"options search_path", "options=-c%20search_path%3Dapp", "search_path=app"},
 		{"migrations table quoted", "x-migrations-table-quoted=true", "x-migrations-table-quoted"},
 	}
@@ -340,28 +340,26 @@ func TestDatabaseErrorHidesItsCause(t *testing.T) {
 	}
 }
 
-// A search_path is a list, so each element is quoted separately: quoting the whole value
-// would name a single schema containing commas, which silently resolves to nothing.
-// Verified against a live cluster — every form below applies, and "$user" round-trips as the
-// value DSQL reports by default.
-func TestSetSearchPathStatement(t *testing.T) {
-	tests := []struct {
-		in, want string
-	}{
-		{"", ""},
-		{"   ", ""},
-		{",", ""},
-		{"app", `SET search_path = "app"`},
-		{"app, public", `SET search_path = "app", "public"`},
-		{" app , public ", `SET search_path = "app", "public"`},
-		{"app,,public", `SET search_path = "app", "public"`},
-		{"$user, public", `SET search_path = "$user", "public"`},
-		{`we"ird`, `SET search_path = "we""ird"`},
-	}
+// The hook writes the raw value into RuntimeParams, which is where pgx keeps a search_path
+// from a URL, so the server parses it as it would through postgres or pgx: APP resolves app,
+// "App" keeps its case, a list stays a list, and quoting stays the operator's to decide.
+func TestSearchPathHookPreservesRawValue(t *testing.T) {
+	for _, searchPath := range []string{"app", "APP", `"App", public`, "app, public", "$user, public"} {
+		poolConfig, err := poolConfigFor(searchPath)
+		if err != nil {
+			t.Fatalf("poolConfigFor(%q): %v", searchPath, err)
+		}
+		if poolConfig.BeforeConnect == nil {
+			t.Fatalf("BeforeConnect is nil for %q, so search_path would never reach the server", searchPath)
+		}
 
-	for _, test := range tests {
-		if got := setSearchPathStatement(test.in); got != test.want {
-			t.Errorf("setSearchPathStatement(%q) = %q, want %q", test.in, got, test.want)
+		// A copy, as pgxpool passes the hook.
+		connConfig := poolConfig.ConnConfig.Copy()
+		if err := poolConfig.BeforeConnect(context.Background(), connConfig); err != nil {
+			t.Fatalf("BeforeConnect(%q): %v", searchPath, err)
+		}
+		if got := connConfig.RuntimeParams["search_path"]; got != searchPath {
+			t.Errorf("RuntimeParams[search_path] = %q, want %q verbatim", got, searchPath)
 		}
 	}
 }
@@ -386,17 +384,9 @@ func TestPoolConfigPinsConnectorLifetimes(t *testing.T) {
 			poolConfig.MaxConnIdleTime, awsdsql.DefaultMaxConnIdleTime)
 	}
 
-	// No search_path means no hook at all, rather than one issuing an empty SET.
-	if poolConfig.AfterConnect != nil {
-		t.Error("AfterConnect is set with no search_path in the URL")
-	}
-
-	withSearchPath, err := poolConfigFor("app")
-	if err != nil {
-		t.Fatalf("poolConfigFor: %v", err)
-	}
-	if withSearchPath.AfterConnect == nil {
-		t.Error("AfterConnect is nil, so search_path would never reach the server")
+	// The hook appears only for a URL that carries a search_path.
+	if poolConfig.BeforeConnect != nil {
+		t.Error("BeforeConnect is set with no search_path in the URL")
 	}
 }
 
@@ -526,6 +516,18 @@ func TestIsUndefinedTable(t *testing.T) {
 func TestWithInstanceRejectsNilConfig(t *testing.T) {
 	if _, err := WithInstance(nil, nil); !errors.Is(err, ErrNilConfig) {
 		t.Errorf("WithInstance(nil, nil) = %v, want ErrNilConfig", err)
+	}
+}
+
+// Both paths hold OCCMaxRetries to zero or more, the range occretry's attempt <= MaxRetries
+// loop runs over: parseConfig checks the URL option, validate checks a Config literal.
+func TestWithInstanceRejectsNegativeOCCMaxRetries(t *testing.T) {
+	_, err := WithInstance(nil, &Config{OCCMaxRetries: -1})
+	if err == nil {
+		t.Fatal("WithInstance accepted OCCMaxRetries = -1")
+	}
+	if !strings.Contains(err.Error(), "OCCMaxRetries") {
+		t.Errorf("error %q does not name the offending field", err)
 	}
 }
 

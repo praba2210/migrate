@@ -16,11 +16,11 @@
 // This driver's own two tables are schema-qualified from x-migrations-schema or
 // CURRENT_SCHEMA(), which covers WithInstance too, whose caller supplies a pool this driver
 // never configures. Open additionally honors search_path from the URL, as the postgres and
-// pgx drivers do; it takes a pool hook to get there, because the connector replaces
+// pgx drivers do; it takes a pool hook to restore the value, because the connector replaces
 // ConnConfig.RuntimeParams while building the pool. See poolConfigFor. Measured against a
-// live cluster: a search_path from the URL then takes effect and CURRENT_SCHEMA() resolves
-// from it, which leaves x-migrations-schema an override rather than the only way for a
-// non-admin role to place the two tables.
+// live cluster: a search_path takes effect and CURRENT_SCHEMA() resolves from it, which leaves
+// x-migrations-schema an override rather than the only way for a non-admin role to place the
+// two tables.
 //
 // IAM authentication and optimistic-concurrency retry are delegated to the AWS connector
 // (github.com/awslabs/aurora-dsql-connectors/go/pgx) rather than reimplemented here.
@@ -129,8 +129,8 @@ type Config struct {
 	// too: 0 runs a statement exactly once, and 0 is the default. Retry is opt-in, and it is
 	// worth opting in, because DSQL raises OC001 with no contention at all.
 	// Negative values are a programming error: occretry's loop body never runs, so the
-	// statement is skipped and the caller is told retries were exhausted. parseConfig
-	// rejects them; a Config literal cannot be checked.
+	// statement is skipped and the caller is told retries were exhausted. Both entry points
+	// hold the field to zero or more — parseConfig on the URL option, validate on a literal.
 	//
 	// OCCMaxRetryDelay is a Duration, so an unsuffixed literal is nanoseconds: write
 	// 3 * time.Second, not 3. Unlike the retry count, 0 here cannot be passed through: it
@@ -159,6 +159,9 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 	if config == nil {
 		return nil, ErrNilConfig
 	}
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
 
 	config.setDefaults()
 
@@ -167,6 +170,18 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 	// ErrNoDatabaseName / ErrNoSchema if still empty; then ensureLockTable followed by
 	// ensureVersionTable.
 	return nil, errNotImplemented
+}
+
+// validate holds a Config to the range parseConfig holds the matching URL options to. It
+// covers WithInstance, where the Config arrives as a literal, so both entry points agree on
+// what is acceptable.
+func (c *Config) validate() error {
+	// occretry loops while attempt <= MaxRetries, so zero or more is what describes an
+	// attempt. See OCCMaxRetries.
+	if c.OCCMaxRetries < 0 {
+		return fmt.Errorf("OCCMaxRetries must not be negative, got %d", c.OCCMaxRetries)
+	}
+	return nil
 }
 
 // setDefaults fills in the optional fields. Required fields are left alone so a missing
@@ -258,13 +273,17 @@ func (d *DSQL) Open(rawURL string) (database.Driver, error) {
 // poolConfigFor builds the pool configuration Open hands the connector.
 //
 // It exists for search_path. pgx keeps a search_path from the URL in
-// ConnConfig.RuntimeParams, and the connector assigns that field a fresh map holding only
-// its own application_name while building the pool, so the value never reaches the server
-// on its own. Setting it from AfterConnect instead lands after the connector is finished,
-// and pgxpool runs the hook before the connection joins the pool, so every connection a
-// migration can be handed already has the schema set. This is also what the connector's own
-// preferred example does (example/src/example_preferred.go), which hardcodes one schema
-// where this takes whatever the operator wrote.
+// ConnConfig.RuntimeParams and sends it in the startup packet, and the connector assigns that
+// field a fresh map holding only its own application_name while building the pool, which makes
+// a hook the route the value takes. Writing it back from BeforeConnect lands after the
+// connector is finished: pgxpool hands the hook a per-connection copy of the ConnConfig, and
+// the connector chains the hook ahead of its own, so every connection a migration can be
+// handed starts with the schema set.
+//
+// The value goes over verbatim, so the server parses it exactly as it would through postgres
+// or pgx: APP resolves app, "App" keeps its case, an element holding a comma is quoted by
+// whoever wrote it, and a value the server declines surfaces on the first connection. Parsing
+// it here instead would answer all four differently.
 //
 // Only search_path is carried over. rejectIgnoredOptions refuses the options spelling of it
 // rather than parsing it, and any other PostgreSQL parameter in the URL stays as it was
@@ -284,42 +303,17 @@ func poolConfigFor(searchPath string) (*pgxpool.Config, error) {
 	poolConfig.MaxConnLifetime = awsdsql.DefaultMaxConnLifetime
 	poolConfig.MaxConnIdleTime = awsdsql.DefaultMaxConnIdleTime
 
-	if statement := setSearchPathStatement(searchPath); statement != "" {
-		poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-			if _, err := conn.Exec(ctx, statement); err != nil {
-				return fmt.Errorf("dsql: setting search_path to %q: %w", searchPath, err)
-			}
+	// A search_path in the URL gets the hook; without one the connector's own startup
+	// parameters stand as they are. RuntimeParams is there to write to: pgxpool.ParseConfig
+	// above creates the map, and the connector's replacement is a map literal.
+	if searchPath != "" {
+		poolConfig.BeforeConnect = func(_ context.Context, connConfig *pgx.ConnConfig) error {
+			connConfig.RuntimeParams["search_path"] = searchPath
 			return nil
 		}
 	}
 
 	return poolConfig, nil
-}
-
-// setSearchPathStatement renders the SET that applies searchPath, or "" if there is nothing
-// to set. A search_path is a comma-separated list, so each element is quoted on its own:
-// quoting the whole value would name one schema containing commas. Empty elements are
-// dropped, because a trailing comma renders as "" and the server rejects that.
-//
-// The value is an operator-supplied string that becomes SQL, hence the quoting rather than
-// a bound parameter — SET takes none. Quoting also settles the case: an element keeps the
-// case it was written in, where postgres and pgx send search_path in the startup packet and
-// the server folds an unquoted element to lower case. Lowercase names, which is what the
-// spelling in every example here is, land the same either way.
-//
-// Measured against a live cluster: single schemas, the list form, surrounding whitespace and
-// "$user" all apply, and a schema that does not exist is accepted silently, as in PostgreSQL.
-func setSearchPathStatement(searchPath string) string {
-	quoted := make([]string, 0, 2)
-	for _, element := range strings.Split(searchPath, ",") {
-		if element = strings.TrimSpace(element); element != "" {
-			quoted = append(quoted, quoteIdentifier(element))
-		}
-	}
-	if len(quoted) == 0 {
-		return ""
-	}
-	return "SET search_path = " + strings.Join(quoted, ", ")
 }
 
 // parseConfig reads the driver's options from the URL. All configuration comes from the
@@ -403,17 +397,15 @@ func parseConfig(purl *nurl.URL) (*Config, error) {
 // them. Same reasoning as ErrPasswordSet: an operator who sets one of these has an
 // expectation, and silently discarding it is worse than refusing to start.
 func rejectIgnoredOptions(query nurl.Values) error {
-	// search_path is honored by Open, via poolConfigFor. The options spelling of it is not:
-	// the connector replaces ConnConfig.RuntimeParams, where pgx keeps it, so it never
-	// reaches the server, and it carries arbitrary -c flags this driver would have to parse
-	// and then apply one at a time. Applying only the search_path out of an options string
-	// and dropping whatever else it held would be worse than refusing it. Rejected rather
-	// than ignored for the same reason as ErrPasswordSet: an operator who wrote it has an
-	// expectation. It is worth naming the supported spelling, because the options form is
-	// what the Aurora DSQL ORM integrations tell users to write; it works for their raw
-	// clients, which do not go through this connector.
+	// search_path is honored by Open, via poolConfigFor. The options spelling of it carries
+	// arbitrary -c flags alongside, which this driver would have to parse and then apply one at
+	// a time, so it is refused whole and the operator writes the spelling that is applied.
+	// Refused rather than ignored for the same reason as ErrPasswordSet: an operator who wrote
+	// it has an expectation. It is worth naming the supported spelling, because the options
+	// form is what the Aurora DSQL ORM integrations tell users to write; it works for their raw
+	// clients, which go straight to the server rather than through this connector.
 	if query.Has("options") {
-		return errors.New("options is not supported: the connector replaces RuntimeParams, so it never reaches the server. " +
+		return errors.New("options is not supported: it carries arbitrary -c flags, and this driver applies search_path alone. " +
 			"Write search_path=app instead of options=-c search_path=app, which Open applies to every connection")
 	}
 	// postgres can place the migrations table in a schema other than the working one, which
