@@ -284,6 +284,10 @@ func TestParseConfigRejectsPassword(t *testing.T) {
 		"dsql://admin:hunter2@cluster.dsql.us-east-1.on.aws:5432/postgres",
 		"dsql://admin:@cluster.dsql.us-east-1.on.aws/postgres", // present but empty
 		"dsql://:hunter2@cluster.dsql.us-east-1.on.aws/postgres",
+		// The query spelling reaches the connector, which has no password parameter to
+		// read it with, so it is refused here as well.
+		"dsql://admin@cluster.dsql.us-east-1.on.aws/postgres?password=hunter2",
+		"dsql://admin@cluster.dsql.us-east-1.on.aws/postgres?password=", // present but empty
 	}
 	for _, rawURL := range rejected {
 		t.Run(rawURL, func(t *testing.T) {
@@ -473,31 +477,38 @@ func TestLockID(t *testing.T) {
 	}
 }
 
-func TestIsLockConflict(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"unique violation", &pgconn.PgError{Code: pgerrcode.UniqueViolation}, true},
-		{"wrapped unique violation", errors.Join(errors.New("ctx"), &pgconn.PgError{Code: pgerrcode.UniqueViolation}), true},
-		// DSQL's OCC failures are retryable, not lock-held. OC001 fires with no
-		// contention at all, so calling one a lock conflict would tell an operator to
-		// wait for a lock nobody holds. retry() handles these instead.
-		{"serialization failure", &pgconn.PgError{Code: pgerrcode.SerializationFailure}, false},
-		{"occ mutation conflict", &pgconn.PgError{Code: "OC000"}, false},
-		{"occ schema conflict", &pgconn.PgError{Code: "OC001"}, false},
-		{"undefined table", &pgconn.PgError{Code: pgerrcode.UndefinedTable}, false},
-		{"plain error", errors.New("nope"), false},
-		{"nil", nil, false},
+// Taking and releasing the lock retry a 40001 whatever OCCMaxRetries says: the
+// no-rows-affected arm that reports ErrLocked is only reached on a second attempt, and a
+// DELETE that gives up leaves the row behind. The plain retry() beside it honors the setting,
+// which is the contrast worth pinning.
+func TestRetryLockRetriesAtTheDefaultOCCMaxRetries(t *testing.T) {
+	config := &Config{OCCMaxRetryDelay: time.Millisecond}
+	config.setDefaults()
+	if config.OCCMaxRetries != 0 {
+		t.Fatalf("OCCMaxRetries = %d, want the default of 0 for this test", config.OCCMaxRetries)
+	}
+	d := &DSQL{config: config}
+	conflict := func(attempts *int) func() error {
+		return func() error {
+			*attempts++
+			return &pgconn.PgError{Code: pgerrcode.SerializationFailure}
+		}
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := isLockConflict(test.err); got != test.want {
-				t.Errorf("isLockConflict(%v) = %v, want %v", test.err, got, test.want)
-			}
-		})
+	lockAttempts := 0
+	if err := d.retryLock(context.Background(), conflict(&lockAttempts)); err == nil {
+		t.Fatal("retryLock returned nil for a persistent conflict")
+	}
+	if lockAttempts != lockRetries+1 {
+		t.Errorf("retryLock made %d attempts, want %d: one run plus lockRetries", lockAttempts, lockRetries+1)
+	}
+
+	statementAttempts := 0
+	if err := d.retry(context.Background(), conflict(&statementAttempts)); err == nil {
+		t.Fatal("retry returned nil for a persistent conflict")
+	}
+	if statementAttempts != 1 {
+		t.Errorf("retry made %d attempts at OCCMaxRetries = 0, want 1", statementAttempts)
 	}
 }
 
@@ -548,7 +559,10 @@ func TestNotImplemented(t *testing.T) {
 		{"Lock", func(d *DSQL) error { return d.Lock() }},
 		{"Unlock", func(d *DSQL) error { d.isLocked.Store(true); return d.Unlock() }},
 		{"Run", func(d *DSQL) error { return d.Run(strings.NewReader("SELECT 1")) }},
-		{"runStatement", func(d *DSQL) error { return d.runStatement(ctx, []byte("SELECT 1")) }},
+		// applyStatement is written; it is here because it has to carry runStatement's
+		// error out through the retry rather than swallow it.
+		{"applyStatement", func(d *DSQL) error { return d.applyStatement(ctx, []byte("SELECT 1")) }},
+		{"runStatement", func(d *DSQL) error { _, err := d.runStatement(ctx, []byte("SELECT 1")); return err }},
 		{"awaitAsyncJob", func(d *DSQL) error { return d.awaitAsyncJob(ctx, "jh2gbtx4mzhgfkbimtgwn5j45y") }},
 		{"SetVersion", func(d *DSQL) error { return d.SetVersion(1, false) }},
 		{"Version", func(d *DSQL) error { _, _, err := d.Version(); return err }},

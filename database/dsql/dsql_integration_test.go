@@ -57,8 +57,11 @@ func TestIntegrationLockIsExclusive(t *testing.T) {
 	//
 	// Cover both losing shapes, since DSQL adjudicates at COMMIT: a migrator that starts
 	// concurrently commits 40001, and one that starts after the winner committed sees the
-	// row and gets 23505. Both have to reach the caller as database.ErrLocked, including
-	// with retry off, which is x-occ-max-retries=0 and the default.
+	// row and affects no rows. Both have to reach the caller as database.ErrLocked,
+	// including with retry off, which is x-occ-max-retries=0 and the default — retryLock is
+	// what carries the first shape there. Cover Unlock under the same conflict: it retries
+	// for the same reason, and a DELETE that gave up would leave the row for every later run
+	// to trip over.
 	t.Skip("pending: Lock is not implemented yet")
 }
 
@@ -75,6 +78,7 @@ func TestIntegrationAsyncDDL(t *testing.T) {
 	// the same way. The wait is unconditional, so there is no opt-out to cover.
 	//
 	// This is also what measures how long sys.wait_for_job blocks against the 60-minute
-	// connection cap, and what a failed job looks like from sys.jobs. See runStatement.
+	// connection cap, and what a failed job looks like from sys.jobs. See applyStatement,
+	// which retries the enqueue and waits on the job_id outside that retry.
 	t.Skip("pending: Run is not implemented yet")
 }

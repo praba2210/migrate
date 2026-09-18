@@ -90,6 +90,11 @@ const (
 	// three nanoseconds, not three seconds. One millisecond is also the finest value
 	// x-occ-max-retry-delay can express.
 	minOCCRetryDelay = time.Millisecond
+
+	// lockRetries is the retry count Lock and Unlock use in place of OCCMaxRetries. One
+	// attempt is enough for the winner's row to become visible; the rest are room for a
+	// cluster under load. See retryLock.
+	lockRetries = 10
 )
 
 var (
@@ -332,6 +337,14 @@ func parseConfig(purl *nurl.URL) (*Config, error) {
 			return nil, ErrPasswordSet
 		}
 	}
+	// The query spelling needs its own check, on the same terms. FilterCustomQuery strips
+	// only x-*, so password= travels all the way to the connector, whose
+	// ParseConnectionString reads region, profile and tokenDurationSecs and leaves every
+	// other key where it lies. query.Has reports the key rather than a value, so
+	// "?password=" counts too.
+	if query.Has("password") {
+		return nil, ErrPasswordSet
+	}
 
 	if err := rejectIgnoredOptions(query); err != nil {
 		return nil, err
@@ -457,6 +470,23 @@ func (d *DSQL) retry(ctx context.Context, fn func() error) error {
 	return occretry.Retry(ctx, d.config.occConfig(), fn)
 }
 
+// retryLock runs fn like retry, with a retry count of its own. The lock row is where a second
+// attempt decides whether the answer is right rather than merely faster: ErrLocked is reported
+// when the INSERT affects no rows, which a 40001 loser reaches only once the winner's row is
+// in its snapshot, and releasing the lock has to land at all, because a row left behind
+// outlives the process and every later run then fails to acquire it. DSQL raises OC001 without
+// contention, so neither can rest on OCCMaxRetries, whose default is 0. A caller who asked for
+// more than lockRetries keeps it.
+//
+// The backoff schedule stays the caller's: MaxWait comes from OCCMaxRetryDelay, so the ceiling
+// here moves with x-occ-max-retry-delay — across the ten retries that is about 26s at the 5s
+// default and about 11ms at the 1ms floor. One knob governs every backoff in the driver.
+func (d *DSQL) retryLock(ctx context.Context, fn func() error) error {
+	cfg := d.config.occConfig()
+	cfg.MaxRetries = max(cfg.MaxRetries, lockRetries)
+	return occretry.Retry(ctx, cfg, fn)
+}
+
 func (d *DSQL) Close() error {
 	if d.db == nil {
 		return nil
@@ -469,11 +499,15 @@ func (d *DSQL) Close() error {
 // always a unique violation: DSQL adjudicates conflicts at COMMIT under snapshot
 // isolation, so two migrators inserting the same key concurrently both succeed at
 // statement time and the loser commits with SQLSTATE 40001. A migrator that starts after
-// the winner has committed sees the row in its snapshot and gets 23505 instead.
+// the winner has committed sees the row in its snapshot, and a bare INSERT would report that
+// one as 23505.
 //
 // So "already held" is treated as a value rather than an error: INSERT ... ON CONFLICT DO
-// NOTHING, and no rows affected means someone else holds it. 40001 stays with retry(),
-// where it belongs, and ErrLocked does not depend on which of the two codes came back.
+// NOTHING, and no rows affected means someone else holds it. The late arrival answers that
+// way on its first attempt; the concurrent loser needs a second one, by which time the
+// winner's row is in its snapshot. retryLock is what provides it, independently of
+// OCCMaxRetries, whose default of 0 would leave that loser holding a raw 40001. cockroachdb
+// takes the same line, wrapping its whole Lock in crdb.ExecuteTx.
 //
 // A process killed while holding the lock leaves the row behind; x-force-lock lets an
 // operator delete it deliberately.
@@ -483,14 +517,14 @@ func (d *DSQL) Lock() error {
 		// Inside it, a retried attempt would re-run the DELETE and could remove a row a
 		// second migrator committed in the meantime, so both would believe they hold the
 		// lock. Force-lock clears a stale row, not a live one.
-		return d.retry(context.Background(), func() error {
+		return d.retryLock(context.Background(), func() error {
 			// TODO: INSERT lockID() ... ON CONFLICT (lock_id) DO NOTHING, and return
 			// database.ErrLocked bare when RowsAffected is 0, so callers can match it
-			// with errors.Is. Also map a 23505 from the INSERT or the COMMIT through
-			// isLockConflict, which retry() passes through untouched because a unique
-			// violation is not one of the OCC codes. An OCC loser (40001) is retried
-			// instead, and on the next attempt the winner's row is visible, so the
-			// no-rows-affected arm reports it.
+			// with errors.Is. An OCC loser (40001) is retried here, and on the next
+			// attempt the winner's row is visible, so the no-rows-affected arm reports
+			// it. The ON CONFLICT clause leaves no 23505 to map: measured on a live
+			// cluster, both concurrent inserts report one row affected and the loser
+			// fails at COMMIT with 40001.
 			return errNotImplemented
 		})
 	})
@@ -498,7 +532,9 @@ func (d *DSQL) Lock() error {
 
 func (d *DSQL) Unlock() error {
 	return database.CasRestoreOnErr(&d.isLocked, true, false, database.ErrNotLocked, func() error {
-		return d.retry(context.Background(), func() error {
+		// retryLock rather than retry, for the release half of the reason given there: the
+		// row is durable, so a DELETE that gives up leaves a lock nobody holds.
+		return d.retryLock(context.Background(), func() error {
 			// TODO: DELETE the lock row by lockID(). Treat isUndefinedTable as success,
 			// because Drop removes the lock table and Migrate still calls Unlock after.
 			return errNotImplemented
@@ -533,23 +569,61 @@ func (d *DSQL) lockID() (string, error) {
 // which DSQL requires for a file holding more than one DDL. Each piece is retried on its
 // own; what must never be replayed is a piece that already committed.
 func (d *DSQL) Run(migration io.Reader) error {
-	// TODO: read the reader and hand it to runStatement. When !MultiStatementEnabled that
-	// is one call under retry(). When enabled, split with multistmt.Parse on ";" and wrap
-	// each piece in its own retry() — the piece is its own transaction, so an OCC failure
-	// committed nothing and re-running just that piece is safe. Do not hold one retry()
-	// around the whole loop: that would replay pieces that already succeeded.
+	// TODO: read the reader and hand it to applyStatement. When !MultiStatementEnabled that
+	// is one call. When enabled, split with multistmt.Parse on ";" and call it once per
+	// piece — the piece is its own transaction, so an OCC failure committed nothing and
+	// re-running just that piece is safe. Nothing wraps the loop itself: that would replay
+	// pieces that already succeeded.
 	//
 	// Note the splitter is a plain byte search for ";" with no SQL awareness: it breaks
 	// dollar-quoted bodies, string literals and comments. Hence off by default.
 	return errNotImplemented
 }
 
-// runStatement executes one statement.
+// applyStatement runs one statement to completion, which for a statement that enqueues an
+// asynchronous DDL job means waiting for the job as well.
 //
-// Callers wrap this in retry(), so it must return the driver's error unwrapped — see
+// The retry covers the enqueue alone. Once the statement has returned a job_id the work is
+// enqueued, and re-running it costs something either way, both measured on a live cluster:
+// CREATE INDEX ASYNC reports 42P07 for the index that now exists, which is not an OCC code, so
+// it stops the migration and leaves the version dirty after the DDL succeeded, while ALTER
+// TABLE ASYNC ... VALIDATE CONSTRAINT enqueues a whole new validation job each time it is
+// re-run against a job still in flight — three re-runs, three jobs — and returns no job_id at
+// all once the constraint is valid. Waiting outside the retry is also what the engine permits:
+// CREATE INDEX ASYNC may run inside a transaction block, while CALL sys.wait_for_job answers
+// 0A000 there, because the procedure commits between polls.
+//
+// The wait is unconditional, so there is no setting for it: Run returns once the job is
+// finished, which is what lets the version migrate then marks clean describe the schema it
+// actually has. Run returning is migrate's signal that the migration applied — it clears the
+// dirty flag immediately afterwards, with nothing in between (migrate.go, Run then
+// SetVersion(target, false)). Waiting is also what surfaces a build that failed, while
+// sys.jobs still holds it: those rows live 30 minutes past a terminal state, and a failed
+// CREATE INDEX ASYNC leaves an INVALID index that goes on enforcing uniqueness until it is
+// dropped.
+func (d *DSQL) applyStatement(ctx context.Context, statement []byte) error {
+	var jobID string
+	err := d.retry(ctx, func() error {
+		var runErr error
+		jobID, runErr = d.runStatement(ctx, statement)
+		return runErr
+	})
+	if err != nil {
+		return err
+	}
+	if jobID == "" {
+		return nil
+	}
+	return d.awaitAsyncJob(ctx, jobID)
+}
+
+// runStatement executes one statement and reports the job_id of the asynchronous DDL job it
+// enqueued, or the empty string when it enqueued none.
+//
+// applyStatement wraps this in retry(), so it must return the driver's error unwrapped — see
 // retry() for why. The database.Error carrying the line number belongs to whoever calls
 // retry(), applied to what retry() returns.
-func (d *DSQL) runStatement(ctx context.Context, statement []byte) error {
+func (d *DSQL) runStatement(ctx context.Context, statement []byte) (string, error) {
 	// TODO: skip blank statements; apply config.StatementTimeout via context.WithTimeout
 	// only when it is non-zero, as postgres and pgx both do. Zero is "no limit", and
 	// context.WithTimeout(ctx, 0) yields a context that has already expired.
@@ -559,29 +633,20 @@ func (d *DSQL) runStatement(ctx context.Context, statement []byte) error {
 	//
 	//   - the statement returns a job_id (CREATE [UNIQUE] INDEX ... ASYNC today, and ALTER
 	//     TABLE ASYNC ... VALIDATE CONSTRAINT, which is the only way to add a validated FK
-	//     or CHECK on DSQL): QueryContext and scan the job_id row, then awaitAsyncJob.
-	//     ExecContext cannot be used, because stdlib returns driver.RowsAffected, an int64,
-	//     so the row is discarded before a sql.Result exists. Match with comments stripped
-	//     first, so a comment cannot hide the keywords, and fail loudly if a statement
-	//     matched but no job_id came back rather than reporting a job that was never waited
-	//     on.
-	//   - otherwise: ExecContext.
-	//
-	// Always wait, so there is no setting for it: Run returns once the job is finished, which
-	// is what lets the version migrate then marks clean describe the schema it actually has.
-	// Run returning is migrate's signal that the migration applied — it clears the dirty flag
-	// immediately afterwards, with nothing in between (migrate.go, Run then
-	// SetVersion(target, false)). Waiting is also what surfaces a build that failed, while
-	// sys.jobs still holds it: those rows live 30 minutes past a terminal state, and a failed
-	// CREATE INDEX ASYNC leaves an INVALID index that goes on enforcing uniqueness until it
-	// is dropped.
+	//     or CHECK on DSQL): QueryContext and scan the job_id row, and return it for
+	//     applyStatement to wait on. ExecContext cannot be used, because stdlib returns
+	//     driver.RowsAffected, an int64, so the row is discarded before a sql.Result exists.
+	//     Match with comments stripped first, so a comment cannot hide the keywords, and fail
+	//     loudly if a statement matched but no job_id came back rather than reporting a job
+	//     that was never waited on.
+	//   - otherwise: ExecContext, and the empty string.
 	//
 	// Return the *pgconn.PgError as-is. The caller turns it into a database.Error with the
 	// failing line, porting computeLineFromPos from database/pgx/v5/pgx.go:304-316.
 	// Reporting the position matters more here than in the postgres drivers, because the
 	// default path sends the whole file as one statement so pgErr.Position is
 	// file-relative.
-	return errNotImplemented
+	return "", errNotImplemented
 }
 
 // awaitAsyncJob blocks until an enqueued asynchronous DDL job finishes.
@@ -590,16 +655,22 @@ func (d *DSQL) runStatement(ctx context.Context, statement []byte) error {
 // VALIDATE CONSTRAINT both return a job_id as soon as the work is enqueued, so a later
 // migration step can run against an index that is not ready or a constraint that is not
 // validated, and a failed build leaves an INVALID index behind.
+//
+// applyStatement calls this outside the retry around the enqueue, and sys.jobs is
+// cluster-wide, so the job_id stays usable from whichever pooled connection the wait lands
+// on.
 func (d *DSQL) awaitAsyncJob(ctx context.Context, jobID string) error {
-	// TODO: CALL sys.wait_for_job(jobID) outside any transaction block; fail the migration
-	// unless it returns true, since a false means the job failed or the wait timed out and
-	// neither raises. A false is ambiguous between those two, so re-read sys.jobs.status to
-	// say which, and note that terminal jobs are deleted after 30 minutes.
+	// TODO: CALL sys.wait_for_job(jobID) outside any transaction block, which the procedure
+	// requires because it commits between polls; fail the migration unless it returns true.
+	// A false is the job's own outcome and raises nothing, so read sys.jobs to report the
+	// reason: status tells failed from cancelled, and details carries the message verbatim,
+	// e.g. "found duplicate key(s) while validating index uniqueness". Terminal jobs are
+	// deleted after 30 minutes.
 	//
-	// Do not put this inside the retry() around the statement that enqueued the job:
-	// finishing the job changes the catalog, so a concurrent OC001 here would re-run the
-	// CREATE INDEX ASYNC and enqueue a second build. sys.jobs is cluster-wide, so the
-	// job_id is still usable from another pooled connection.
+	// The procedure polls once a second until the job reaches a terminal state and has no
+	// timeout of its own. Nothing else bounds it either: Run takes no context, so ctx here is
+	// Background, and the 60-minute connection limit is the only ceiling on an index build
+	// that never finishes. Worth revisiting once there is a caller that can pass a deadline.
 	return errNotImplemented
 }
 
@@ -669,18 +740,6 @@ func (d *DSQL) ensureLockTable() error {
 // qualifiedTable renders a schema-qualified, quoted table name.
 func (d *DSQL) qualifiedTable(table string) string {
 	return quoteIdentifier(d.config.SchemaName) + "." + quoteIdentifier(table)
-}
-
-// isLockConflict reports whether err means another migrator already holds the lock, i.e. a
-// unique violation on the lock row.
-//
-// DSQL's optimistic-concurrency failures are deliberately not treated as lock conflicts.
-// They are retryable, and OC001 fires with no contention at all, so reporting one as
-// ErrLocked would tell an operator to wait for a lock nobody holds. They are handled by
-// retry() instead, via the connector's occretry.IsOCCError.
-func isLockConflict(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.SQLState() == pgerrcode.UniqueViolation
 }
 
 func isUndefinedTable(err error) bool {

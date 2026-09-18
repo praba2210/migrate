@@ -5,15 +5,15 @@
 > returns `dsql: driver skeleton, not implemented yet`. The driver is excluded from the
 > default CLI build; add `-tags dsql` to compile it in.
 
-Aurora DSQL is PostgreSQL wire-compatible but a distinct distributed engine. It has no
-advisory locks and no `TRUNCATE`, which the `postgres` and `pgx` drivers both rely on, so
-it needs its own driver rather than a DSN change.
+This driver applies migrations to Amazon Aurora DSQL. It keeps the migrations and lock
+tables, holds the migration lock as a table row, and waits for asynchronous DDL to finish
+before reporting a migration as applied.
 
-`dsql://` URLs must not carry a password — one is rejected rather than ignored, because the
-connector discards it and authenticates with IAM regardless. IAM authentication, TLS and
-optimistic-concurrency retry are handled by the
+IAM authentication, TLS and optimistic-concurrency retry come from the
 [AWS Aurora DSQL connector for pgx](https://github.com/awslabs/aurora-dsql-connectors/tree/main/go/pgx),
-which generates a token per connection from the default AWS credential chain.
+which generates a token per connection from the default AWS credential chain. A password in
+the URL is an error, written either as `admin:pw@host` or as `?password=pw`, since
+authentication uses the token regardless.
 
 ## URL
 
@@ -32,6 +32,10 @@ Connector options, passed through untouched:
 | `region` | parsed from host | AWS region of the cluster |
 | `profile` | default chain | AWS shared-config profile |
 | `tokenDurationSecs` | `900` | IAM token validity |
+
+Those three go to the connector, and `search_path` reaches the connection through a pool
+hook. Any other libpq parameter in the URL is dropped, `sslmode` and `connect_timeout`
+included; set those on your own pool and use `WithInstance`.
 
 Driver options:
 
@@ -119,8 +123,12 @@ Other DSQL constraints worth knowing:
 
 ## When a migration fails
 
-An OCC conflict (`OC000`, `OC001`, `40001`) is retryable, and this driver retries one for
-you. If a migration fails anyway, migrate has already marked the version dirty and will not
+An OCC conflict (`OC000`, `OC001`, `40001`) is retryable. Set `x-occ-max-retries` above its
+default of `0` to have the driver retry a statement for you; taking and releasing the
+migration lock retry either way, since reporting "already locked" and letting go of the lock
+both depend on it. `x-occ-max-retry-delay` bounds the backoff for all of them.
+
+If a migration fails anyway, migrate has already marked the version dirty and will not
 run again until that is cleared: a second `migrate up` stops with
 `Dirty database version N. Fix and force version.` Re-running is not the recovery, because
 migrate cannot know how much of the failed file was applied.
