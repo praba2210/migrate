@@ -2,6 +2,7 @@ package dsql
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -13,6 +14,7 @@ import (
 
 	awsdsql "github.com/awslabs/aurora-dsql-connectors/go/pgx/dsql"
 	"github.com/awslabs/aurora-dsql-connectors/go/pgx/occretry"
+	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -21,6 +23,11 @@ import (
 const (
 	testSchema   = "public"
 	testDatabase = "postgres"
+
+	// userTable and trivialStatement stand in for a caller's own table and a statement that
+	// enqueues nothing, wherever the test is about something else.
+	userTable        = "users"
+	trivialStatement = "SELECT 1"
 )
 
 func mustParseConfig(t *testing.T, rawURL string) *Config {
@@ -481,7 +488,7 @@ func TestLockID(t *testing.T) {
 // no-rows-affected arm that reports ErrLocked is only reached on a second attempt, and a
 // DELETE that gives up leaves the row behind. The plain retry() beside it honors the setting,
 // which is the contrast worth pinning.
-func TestRetryLockRetriesAtTheDefaultOCCMaxRetries(t *testing.T) {
+func TestRetryAtLeastFloorsTheRetryCount(t *testing.T) {
 	config := &Config{OCCMaxRetryDelay: time.Millisecond}
 	config.setDefaults()
 	if config.OCCMaxRetries != 0 {
@@ -495,12 +502,23 @@ func TestRetryLockRetriesAtTheDefaultOCCMaxRetries(t *testing.T) {
 		}
 	}
 
-	lockAttempts := 0
-	if err := d.retryLock(context.Background(), conflict(&lockAttempts)); err == nil {
-		t.Fatal("retryLock returned nil for a persistent conflict")
-	}
-	if lockAttempts != lockRetries+1 {
-		t.Errorf("retryLock made %d attempts, want %d: one run plus lockRetries", lockAttempts, lockRetries+1)
+	for _, test := range []struct {
+		name    string
+		retries int
+	}{
+		{"lock", lockRetries},
+		{"unlock", unlockRetries},
+		{"bootstrap", bootstrapRetries},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			attempts := 0
+			if err := d.retryAtLeast(context.Background(), test.retries, conflict(&attempts)); err == nil {
+				t.Fatal("retryAtLeast returned nil for a persistent conflict")
+			}
+			if attempts != test.retries+1 {
+				t.Errorf("made %d attempts, want %d: one run plus the floor", attempts, test.retries+1)
+			}
+		})
 	}
 
 	statementAttempts := 0
@@ -509,6 +527,135 @@ func TestRetryLockRetriesAtTheDefaultOCCMaxRetries(t *testing.T) {
 	}
 	if statementAttempts != 1 {
 		t.Errorf("retry made %d attempts at OCCMaxRetries = 0, want 1", statementAttempts)
+	}
+
+	// A caller who asked for more than the floor keeps it.
+	generous := &Config{OCCMaxRetries: unlockRetries + 5, OCCMaxRetryDelay: time.Millisecond}
+	generous.setDefaults()
+	attempts := 0
+	if err := (&DSQL{config: generous}).retryAtLeast(context.Background(), lockRetries, conflict(&attempts)); err == nil {
+		t.Fatal("retryAtLeast returned nil for a persistent conflict")
+	}
+	if attempts != generous.OCCMaxRetries+1 {
+		t.Errorf("made %d attempts, want %d: the floor must not cap OCCMaxRetries", attempts, generous.OCCMaxRetries+1)
+	}
+}
+
+// Lock races migrate's LockTimeout, so its forced retries have to fit inside it. migrate
+// abandons Lock on timeout but the call goes on running, and a retry that lands afterwards
+// writes a durable lock row nothing will release. Unlock is not on that path.
+//
+// The bound is computed from the connector's own schedule so it tracks a change to either.
+func TestLockRetriesFitInsideMigrateLockTimeout(t *testing.T) {
+	config := &Config{} // the worst case is the default delay, which is the largest
+	config.setDefaults()
+	occ := config.occConfig()
+
+	// occretry sleeps wait+jitter before each retry, jitter being up to a quarter of wait,
+	// then multiplies wait and clamps it to MaxWait.
+	worst := time.Duration(0)
+	wait := occ.InitialWait
+	for range lockRetries {
+		worst += wait + wait/4
+		if wait = time.Duration(float64(wait) * occ.Multiplier); wait > occ.MaxWait {
+			wait = occ.MaxWait
+		}
+	}
+
+	if worst >= migrate.DefaultLockTimeout {
+		t.Errorf("Lock can back off for %v, at or past migrate's %v lock timeout: a retry landing after the timeout leaves a lock row nothing releases",
+			worst, migrate.DefaultLockTimeout)
+	}
+}
+
+// Classification decides whether a statement is run through the query API to collect a
+// job_id, so a miss either loses the wait or reports a job that was never enqueued.
+func TestEnqueuesAsyncJob(t *testing.T) {
+	enqueues := []string{
+		`CREATE INDEX ASYNC idx ON users (email)`,
+		`create index async idx on users (email)`,
+		`CREATE UNIQUE INDEX ASYNC idx ON users (email)`,
+		"\n\t CREATE INDEX ASYNC idx ON users (email)",
+		"-- add an index\nCREATE INDEX ASYNC idx ON users (email)",
+		"/* add an index */ CREATE INDEX ASYNC idx ON users (email)",
+		"-- CREATE TABLE decoys (id INT)\n/* and another */\nCREATE  INDEX\n  ASYNC idx ON users (email)",
+		// The second form that returns a job_id. Only this spelling does: see
+		// asyncValidatePattern.
+		`ALTER TABLE ASYNC users VALIDATE CONSTRAINT users_email_check`,
+	}
+	for _, statement := range enqueues {
+		if !enqueuesAsyncJob(statement) {
+			t.Errorf("enqueuesAsyncJob(%q) = false, want true: its job_id would never be waited on", statement)
+		}
+	}
+
+	plain := []string{
+		`CREATE TABLE users (id UUID PRIMARY KEY)`,
+		`CREATE INDEX idx ON users (email)`, // no ASYNC: not accepted by DSQL, and returns no job
+		`ALTER TABLE users ADD COLUMN email TEXT`,
+		`ALTER TABLE users VALIDATE CONSTRAINT users_email_check`, // no ASYNC
+		`DROP TABLE users`,
+		`DROP INDEX idx`,
+		`INSERT INTO users (id) VALUES (gen_random_uuid())`,
+		trivialStatement,
+		// Naming the syntax in a comment or a literal is not issuing it.
+		"-- CREATE INDEX ASYNC idx ON users (email)\nSELECT 1",
+		`SELECT 'CREATE INDEX ASYNC'`,
+		"",
+		"   \n\t ",
+		"-- just a comment",
+		"/* unterminated",
+	}
+	for _, statement := range plain {
+		if enqueuesAsyncJob(statement) {
+			t.Errorf("enqueuesAsyncJob(%q) = true, want false: it would be run through the query API and demand a job_id", statement)
+		}
+	}
+}
+
+// Copied alongside computeLineFromPos from database/pgx/v5, so the reported position keeps
+// matching the server's.
+func TestComputeLineFromPos(t *testing.T) {
+	tests := []struct {
+		statement string
+		pos       int
+		line, col uint
+		ok        bool
+	}{
+		{trivialStatement, 1, 1, 1, true},
+		{trivialStatement, 8, 1, 8, true},
+		{"SELECT 1\nFROM nope", 10, 2, 1, true},
+		{"a\r\nb", 3, 2, 1, true},
+		{trivialStatement, 99, 0, 0, false},
+	}
+
+	for _, test := range tests {
+		line, col, ok := computeLineFromPos(test.statement, test.pos)
+		if ok != test.ok || line != test.line || col != test.col {
+			t.Errorf("computeLineFromPos(%q, %d) = (%d, %d, %v), want (%d, %d, %v)",
+				test.statement, test.pos, line, col, ok, test.line, test.col, test.ok)
+		}
+	}
+}
+
+// Drop holds the lock in a row of the lock table, so that table has to be dropped last or
+// the loop loses the lock it is relying on part-way through.
+func TestDropOrdersTheLockTableLast(t *testing.T) {
+	tables := []string{userTable, DefaultLockTable, "orders", DefaultMigrationsTable}
+	ordered := append(withoutTable(tables, DefaultLockTable), lockTableIfPresent(tables, DefaultLockTable)...)
+
+	if len(ordered) != len(tables) {
+		t.Fatalf("ordered %d tables, want all %d", len(ordered), len(tables))
+	}
+	if ordered[len(ordered)-1] != DefaultLockTable {
+		t.Errorf("drop order is %v, want %q last", ordered, DefaultLockTable)
+	}
+
+	// A schema whose lock table is already gone still drops everything else.
+	absent := []string{userTable, "orders"}
+	ordered = append(withoutTable(absent, DefaultLockTable), lockTableIfPresent(absent, DefaultLockTable)...)
+	if len(ordered) != len(absent) {
+		t.Errorf("ordered %v, want just %v when the lock table is absent", ordered, absent)
 	}
 }
 
@@ -542,41 +689,117 @@ func TestWithInstanceRejectsNegativeOCCMaxRetries(t *testing.T) {
 	}
 }
 
-// Every method still to be written must fail loudly. This also pins which parts of the
-// skeleton are outstanding, so finishing one means deleting a line here.
-func TestNotImplemented(t *testing.T) {
-	newDriver := func() *DSQL {
-		config := &Config{DatabaseName: testDatabase, SchemaName: testSchema}
-		config.setDefaults()
-		return &DSQL{config: config}
-	}
-	ctx := context.Background()
+// Version and Unlock classify the error retry hands back, so retry returns a non-OCC error
+// untouched and on the first attempt. That is what keeps "no rows yet" reading as NilVersion
+// and "the table is gone" reading as released.
+func TestRetryPassesNonOCCErrorsThrough(t *testing.T) {
+	config := &Config{OCCMaxRetries: 3, OCCMaxRetryDelay: time.Millisecond}
+	config.setDefaults()
+	d := &DSQL{config: config}
 
 	tests := []struct {
 		name string
-		call func(*DSQL) error
+		err  error
+		is   func(error) bool
 	}{
-		{"Lock", func(d *DSQL) error { return d.Lock() }},
-		{"Unlock", func(d *DSQL) error { d.isLocked.Store(true); return d.Unlock() }},
-		{"Run", func(d *DSQL) error { return d.Run(strings.NewReader("SELECT 1")) }},
-		// applyStatement is written; it is here because it has to carry runStatement's
-		// error out through the retry rather than swallow it.
-		{"applyStatement", func(d *DSQL) error { return d.applyStatement(ctx, []byte("SELECT 1")) }},
-		{"runStatement", func(d *DSQL) error { _, err := d.runStatement(ctx, []byte("SELECT 1")); return err }},
-		{"awaitAsyncJob", func(d *DSQL) error { return d.awaitAsyncJob(ctx, "jh2gbtx4mzhgfkbimtgwn5j45y") }},
-		{"SetVersion", func(d *DSQL) error { return d.SetVersion(1, false) }},
-		{"Version", func(d *DSQL) error { _, _, err := d.Version(); return err }},
-		{"Drop", func(d *DSQL) error { return d.Drop() }},
-		{"ensureVersionTable", func(d *DSQL) error { return d.ensureVersionTable() }},
-		{"ensureLockTable", func(d *DSQL) error { return d.ensureLockTable() }},
+		{"no rows", sql.ErrNoRows, func(err error) bool { return errors.Is(err, sql.ErrNoRows) }},
+		{"undefined table", &pgconn.PgError{Code: pgerrcode.UndefinedTable}, isUndefinedTable},
 	}
-
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := test.call(newDriver()); !errors.Is(err, errNotImplemented) {
-				t.Errorf("%s = %v, want errNotImplemented", test.name, err)
+			attempts := 0
+			err := d.retry(context.Background(), func() error {
+				attempts++
+				return test.err
+			})
+			if !test.is(err) {
+				t.Errorf("retry returned %v, which no longer classifies", err)
+			}
+			if attempts != 1 {
+				t.Errorf("attempts = %d, want 1: a non-OCC error must not be retried", attempts)
 			}
 		})
+	}
+}
+
+// WithInstance returns database.Driver while newDriver returns *DSQL, so it assigns and
+// returns separately to hand back a nil interface on failure. Both failure shapes are
+// covered: one rejected by validate, one by the nil-config check ahead of it.
+func TestWithInstanceReturnsANilDriverOnError(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *Config
+	}{
+		{"nil config", nil},
+		{"invalid config", &Config{OCCMaxRetries: -1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			driver, err := WithInstance(nil, test.config)
+			if err == nil {
+				t.Fatal("WithInstance succeeded, want an error")
+			}
+			if driver != nil {
+				t.Errorf("driver = %#v, want nil: a typed nil in the interface reads as non-nil", driver)
+			}
+		})
+	}
+}
+
+// A blank statement is skipped rather than sent, which is what makes the trailing piece of a
+// semicolon-split file harmless. Asserted without a database, since reaching one would mean
+// the statement was not skipped.
+func TestRunStatementSkipsBlankStatements(t *testing.T) {
+	d := &DSQL{config: &Config{}}
+	for _, statement := range []string{"", "   ", "\n\t\n"} {
+		jobID, err := d.runStatement(context.Background(), []byte(statement))
+		if err != nil {
+			t.Errorf("runStatement(%q) = %v, want nil: a blank statement must not be sent", statement, err)
+		}
+		if jobID != "" {
+			t.Errorf("runStatement(%q) reported job %q", statement, jobID)
+		}
+	}
+}
+
+// migrationError is what adds migrate's context, and it has to run outside the retry: a
+// database.Error wrapping the PgError would hide it from the connector's classifier. So the
+// PgError has to survive into the message while the sentinel stays reachable.
+func TestMigrationErrorReportsTheFailingLine(t *testing.T) {
+	statement := []byte("CREATE TABLE users (\n  id NOT_A_TYPE\n)")
+	pgErr := &pgconn.PgError{
+		Code:     pgerrcode.SyntaxError,
+		Message:  `type "not_a_type" does not exist`,
+		Detail:   "a detail",
+		Position: 27, // inside line 2
+	}
+
+	err := migrationError(statement, pgErr)
+
+	var dbErr database.Error
+	if !errors.As(err, &dbErr) {
+		t.Fatalf("migrationError returned %T, want database.Error", err)
+	}
+	if dbErr.Line != 2 {
+		t.Errorf("Line = %d, want 2", dbErr.Line)
+	}
+	if !strings.Contains(dbErr.Err, pgErr.Message) {
+		t.Errorf("message %q does not carry the server's message", dbErr.Err)
+	}
+	if !strings.Contains(dbErr.Err, pgErr.Detail) {
+		t.Errorf("message %q drops the server's detail", dbErr.Err)
+	}
+	if dbErr.OrigErr != pgErr {
+		t.Error("OrigErr is not the server's error")
+	}
+
+	// A non-Postgres error still gets context rather than being dropped.
+	plain := migrationError(statement, errors.New("connection reset"))
+	if !errors.As(plain, &dbErr) {
+		t.Fatalf("migrationError on a plain error returned %T, want database.Error", plain)
+	}
+	if dbErr.Err != "migration failed" {
+		t.Errorf("Err = %q, want %q", dbErr.Err, "migration failed")
 	}
 }
 

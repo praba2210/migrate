@@ -1,29 +1,58 @@
 # Amazon Aurora DSQL
 
-> **Status: skeleton — not usable yet.** The option surface, connector boundary and retry
-> placement below are in place for review, but every operation that touches the database
-> returns `dsql: driver skeleton, not implemented yet`. The driver is excluded from the
-> default CLI build; add `-tags dsql` to compile it in.
+## Introduction
 
-This driver applies migrations to Amazon Aurora DSQL. It keeps the migrations and lock
-tables, holds the migration lock as a table row, and waits for asynchronous DDL to finish
-before reporting a migration as applied.
+This driver applies golang-migrate migrations to Amazon Aurora DSQL. It keeps the
+migrations and lock tables, holds the migration lock as a table row, and waits for
+asynchronous DDL to finish before reporting a migration as applied.
 
-IAM authentication, TLS and optimistic-concurrency retry come from the
-[AWS Aurora DSQL connector for pgx](https://github.com/awslabs/aurora-dsql-connectors/tree/main/go/pgx),
-which generates a token per connection from the default AWS credential chain. A password in
-the URL is an error, written either as `admin:pw@host` or as `?password=pw`, since
-authentication uses the token regardless.
+## Features and Limitations
 
-## URL
+Aurora DSQL's distributed architecture differs from single-node PostgreSQL in a few
+ways that shape how the driver behaves:
+
+- **IAM authentication** — TLS and a per-connection token come from the
+  [Aurora DSQL connector for pgx](https://github.com/awslabs/aurora-dsql-connectors/tree/main/go/pgx),
+  which resolves credentials through the default AWS chain. The token is what
+  authenticates every connection, so a URL carries no password.
+- **Table-row lock** — the migration lock is a row in its own table, which suits DSQL's
+  distributed design. It outlives the session that took it, and `x-force-lock` releases
+  one a previous run left behind. See [Lock](#lock).
+- **Optimistic concurrency** — `x-occ-max-retries` has the connector retry a conflict
+  DSQL reports at COMMIT. See [Concurrency control](#concurrency-control).
+- **Asynchronous DDL** — the driver waits for the job an `ASYNC` statement enqueues, so
+  the version migrate records describes a finished schema. See
+  [Asynchronous DDL](#asynchronous-ddl).
+- **One DDL per transaction** — one DDL statement per migration file applies
+  atomically. See [Writing migrations](#writing-migrations).
+
+## Prerequisites
+
+- Go 1.25+
+- An Amazon Aurora DSQL cluster
+- `dsql:DbConnectAdmin` for the `admin` user, or `dsql:DbConnect` for any other
+- Credentials resolvable from the default AWS chain
+
+## Setup
+
+The `dsql` tag compiles the driver in, keeping the connector and `aws-sdk-go-v2` out of
+the default CLI:
+
+```sh
+go build -tags dsql ./cmd/migrate
+migrate -source file://migrations \
+  -database 'dsql://admin@mycluster.dsql.us-east-1.on.aws/postgres' up
+```
+
+### URL
 
 ```
 dsql://admin@mycluster.dsql.us-east-1.on.aws:5432/postgres?query
 ```
 
-The host may be a full cluster endpoint or a 26-character cluster ID. The region is taken
-from `region`, then the hostname, then `AWS_REGION` or `AWS_DEFAULT_REGION`. TLS is always
-enforced, so `sslmode` is ignored.
+The host accepts a full cluster endpoint or a 26-character cluster ID. The region
+resolves from `region`, then the hostname, then `AWS_REGION` or `AWS_DEFAULT_REGION`.
+TLS is always enforced, so `sslmode` needs no setting.
 
 Connector options, passed through untouched:
 
@@ -33,35 +62,39 @@ Connector options, passed through untouched:
 | `profile` | default chain | AWS shared-config profile |
 | `tokenDurationSecs` | `900` | IAM token validity |
 
-Those three go to the connector, and `search_path` reaches the connection through a pool
-hook. Any other libpq parameter in the URL is dropped, `sslmode` and `connect_timeout`
-included; set those on your own pool and use `WithInstance`.
-
 Driver options:
 
-| URL query | `WithInstance` `Config` | Default | Description |
+| URL query | `Config` field | Default | Description |
 |---|---|---|---|
-| `x-migrations-schema` | `SchemaName` | `CURRENT_SCHEMA()` | Schema holding the migrations and lock tables |
-| `x-migrations-table` | `MigrationsTable` | `schema_migrations` | Name of the migrations table |
-| `x-lock-table` | `LockTable` | `schema_migrations_lock` | Name of the lock table |
-| `x-force-lock` | `ForceLock` | `false` | Take the lock even if a row is already there. Break glass, to recover from a migration that died holding it |
-| `x-statement-timeout` | `StatementTimeout` | none | Abort a statement after N milliseconds |
-| `x-multi-statement` | `MultiStatementEnabled` | `false` | Split a migration file at semicolons |
-| `x-multi-statement-max-size` | `MultiStatementMaxSize` | 10 MB | Parser buffer limit for the above |
-| `x-occ-max-retries` | `OCCMaxRetries` | `0` | Retries of a statement that hits an OCC conflict. Retry is opt-in; see below |
-| `x-occ-max-retry-delay` | `OCCMaxRetryDelay` | `5000` | Bound on the backoff between retries, in milliseconds. Jitter can add up to a further 25% |
+| `x-migrations-schema` | `SchemaName` | `CURRENT_SCHEMA()` | Schema holding the two tables |
+| `x-migrations-table` | `MigrationsTable` | `schema_migrations` | Migrations table name |
+| `x-lock-table` | `LockTable` | `schema_migrations_lock` | Lock table name |
+| `x-force-lock` | `ForceLock` | `false` | Release a lock row left behind |
+| `x-statement-timeout` | `StatementTimeout` | none | Abort a statement after N ms |
+| `x-multi-statement` | `MultiStatementEnabled` | `false` | Split the file at semicolons |
+| `x-multi-statement-max-size` | `MultiStatementMaxSize` | 10 MB | Parser buffer for the above |
+| `x-occ-max-retries` | `OCCMaxRetries` | `0` | Retries after an OCC conflict |
+| `x-occ-max-retry-delay` | `OCCMaxRetryDelay` | `5000` | Backoff ceiling in ms; jitter adds 25% |
 
-`search_path` is honored on the `dsql://` path, as it is by the `postgres` and `pgx`
-drivers. `options=-c search_path=app` is rejected: it carries arbitrary `-c` flags alongside,
-and the error names `search_path=app` as the spelling this driver applies.
+`search_path` reaches the connection through a pool hook. Set any other libpq
+parameter, `sslmode` and `connect_timeout` included, on your own pool and use
+[`WithInstance`](#usage-as-a-library).
 
-## Permissions
+### search_path
 
-The connecting principal needs `dsql:DbConnectAdmin` for the `admin` user, or
-`dsql:DbConnect` for any other, plus credentials resolvable from the default chain.
+`?search_path=app` places unqualified SQL as it does with the `postgres` and `pgx`
+drivers, and resolves `CURRENT_SCHEMA()` to `app`, leaving `x-migrations-schema` an
+override. The value travels verbatim, so the server parses it the same way.
 
-Migrating as a custom role takes three steps, none of which happen automatically — a new
-role has no schema of its own and no access to anyone else's. Connect as `admin` and run:
+Write the plain spelling, `search_path=app`. The driver names that form for you when a URL
+carries `options=-c search_path=app` instead.
+
+`WithInstance` callers own their pool, so they set `search_path` in its config. The
+driver qualifies its own two tables either way.
+
+### Migrating as a custom role
+
+A new DSQL role owns no schema, so three grants make one ready. Connect as `admin`:
 
 ```sql
 CREATE ROLE migrator WITH LOGIN;
@@ -69,118 +102,134 @@ AWS IAM GRANT migrator TO 'arn:aws:iam::123456789012:role/my-migration-role';
 GRANT USAGE, CREATE ON SCHEMA app TO migrator;
 ```
 
-Then migrate with `x-migrations-schema=app`. `sys.iam_pg_role_mappings` lists the
-IAM-to-role mappings if a connection is refused. Because the role's schema is not implied by
-its name, `x-migrations-schema` is how this driver learns where to put the migrations and
-lock tables.
+Then migrate with `x-migrations-schema=app`, which tells the driver where to put the
+migrations and lock tables. `sys.iam_pg_role_mappings` lists the IAM-to-role mappings.
 
-It places those two tables and nothing else. Where your own objects land is decided by your
-SQL, so qualify it:
+The driver places those two tables; your own SQL decides where your objects land:
 
 ```sql
 CREATE TABLE app.users (id UUID PRIMARY KEY);   -- lands in app
 CREATE TABLE users (id UUID PRIMARY KEY);       -- lands wherever search_path points
 ```
 
-The migrations under `examples/` use bare names, as the other drivers' examples do, so add
-the prefix when migrating as a custom role.
+The migrations under `examples/` use bare names, as the other drivers' examples do, so
+add the prefix or set `search_path`.
 
-`?search_path=app` does the same job for unqualified SQL as it does with the `postgres` and
-`pgx` drivers, and also makes `CURRENT_SCHEMA()` resolve to `app`, so `x-migrations-schema`
-becomes an override rather than a requirement. It needs a pool hook to get there: pgx keeps
-`search_path` in `RuntimeParams`, which the connector replaces wholesale while building the
-pool, so `Open` puts the value back from `BeforeConnect`, which the connector chains. The
-value is passed through untouched, so the server parses it exactly as it would through
-`postgres` or `pgx`. `?options=-c search_path=app` is rejected rather than parsed, since it
-can carry other `-c` flags this driver would then have to honor one at a time.
+## Writing migrations
 
-`WithInstance` is unaffected either way, because its caller supplies the pool. A library
-caller who wants `search_path` sets it in their own pool's config. That is why the
-driver still qualifies its own two tables rather than relying on the session setting: the
-hook covers the `dsql://` path, but only qualifying covers both.
+**One DDL statement per file** applies atomically, because a DSQL transaction holds one DDL
+statement and keeps DDL separate from DML. The driver sends the whole file as a single
+statement, which becomes one implicit transaction.
 
-## Writing migrations for DSQL
+`x-multi-statement=true` gives each statement its own transaction. The splitter searches
+for `;` literally, so one DDL per file remains the better answer.
 
-**One DDL statement per file.** A transaction may hold at most one DDL statement and may
-not mix DDL with DML. By default this driver sends the whole file as a single statement,
-which becomes one implicit transaction, so a file with two `CREATE TABLE`s fails.
+DSQL specifics worth knowing:
 
-`x-multi-statement=true` splits the file so each statement gets its own transaction, but
-the splitter is a plain search for `;` with no SQL awareness — it breaks dollar-quoted
-bodies, string literals and comments — and a failure part-way leaves earlier statements
-committed. One DDL per file is the better answer.
+- `CREATE INDEX ASYNC` is how an index is built, and the driver waits for it. See
+  [Asynchronous DDL](#asynchronous-ddl).
+- `BIGINT GENERATED BY DEFAULT AS IDENTITY (CACHE 1)` or a UUID gives you a surrogate
+  key, in place of `SERIAL`.
+- A constraint is added with `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID` and
+  validated with `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT`. Only the validation takes
+  `ASYNC`, and the two are two DDLs, so they belong in two files.
+- `ALTER COLUMN ... TYPE`, `ALTER COLUMN ... SET NOT NULL`, `ADD COLUMN ... NOT NULL
+  DEFAULT`, `TRUNCATE`, materialized views and triggers are unsupported.
+- A transaction carries up to 3,000 rows and 10 MiB.
+- Connections last 60 minutes, so a run finishes inside the hour.
 
-Other DSQL constraints worth knowing:
+[dsql-lint](https://github.com/awslabs/aurora-dsql-tools/tree/main/dsql-lint) reports
+these against your files, down-migrations included, and catches far more than a driver
+can. Run it in CI:
 
-- `CREATE INDEX` must be `CREATE INDEX ASYNC`, which returns once the build is *enqueued*.
-- No `SERIAL`; use `BIGINT GENERATED BY DEFAULT AS IDENTITY (CACHE 1)` or a UUID.
-- `ALTER COLUMN ... TYPE`, `ALTER COLUMN ... SET NOT NULL` and
-  `ADD COLUMN ... NOT NULL DEFAULT` are not supported at all.
-- No `TRUNCATE`, materialized views or triggers.
-- A transaction is capped at 3,000 rows and 10 MiB.
-- DSQL closes every connection at 60 minutes, so a single migration run must finish inside
-  an hour.
+```sh
+uvx dsql-lint migrations/*.sql
+```
+
+`--fix` has dsql-lint rewrite the SQL, which is how the Aurora DSQL ORM integrations use
+it. This driver applies your files as written.
+
+## Lock
+
+`Lock` inserts a row keyed by the schema and both table names, so two migrators sharing
+those exclude each other, and a different `x-lock-table` gives a migrator a lock of its own.
+
+The row outlives the process that took it, which keeps the lock durable across a
+restart. `x-force-lock=true` releases one a previous run left behind:
+
+```sh
+migrate -database 'dsql://...?x-force-lock=true' ... up
+```
+
+It releases whichever row is there, so confirm no other migration is running first.
+
+Creating the version table takes the lock, so a second driver opened against the same
+tables reports `can't acquire lock` while the first holds it. `cockroachdb` behaves the
+same way.
+
+## Concurrency control
+
+DSQL adjudicates conflicts at COMMIT and reports `OC000`, `OC001` or `40001`. Taking and
+releasing the lock retry on their own, which is what lets a concurrent loser report
+"already locked" and a finished run release the lock.
+
+`x-occ-max-retries` extends retry to your migration statements, and
+`x-occ-max-retry-delay` bounds the backoff:
+
+```sh
+migrate -database 'dsql://...?x-occ-max-retries=5' ... up
+```
+
+Around eight retries the backoff reaches migrate's 15-second lock timeout, so keep the
+setting modest or raise that timeout alongside it.
+
+## Asynchronous DDL
+
+`CREATE [UNIQUE] INDEX ASYNC` and `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` hand back
+a `job_id` as soon as their work is enqueued.
+
+The driver waits for the job and reports what `sys.jobs` says when one fails, so a
+migration counts as applied once its index is built and its constraint is validated.
+Migrate clears the dirty flag as soon as `Run` returns, so the wait is what keeps the
+version history describing the schema. AWS recommends it for schema migrations for the
+same reason.
+
+Measured against a live cluster, the wait catches a unique index over duplicate rows,
+which reports a duplicate key and leaves the index `INVALID` and still enforcing
+uniqueness until it is dropped; and a `CHECK` some row violates, which reports
+`is violated by some row` and leaves the constraint unvalidated. Both reach you as
+`migration failed`.
+
+A large index build takes real time, and the 60-minute connection limit applies to it.
 
 ## When a migration fails
 
-An OCC conflict (`OC000`, `OC001`, `40001`) is retryable. Set `x-occ-max-retries` above its
-default of `0` to have the driver retry a statement for you; taking and releasing the
-migration lock retry either way, since reporting "already locked" and letting go of the lock
-both depend on it. `x-occ-max-retry-delay` bounds the backoff for all of them.
+Migrate marks the version dirty, and `migrate up` reports
+`Dirty database version N. Fix and force version.` until that is cleared. Recovery is
+deliberate, because only you know how much of the file landed.
 
-If a migration fails anyway, migrate has already marked the version dirty and will not
-run again until that is cleared: a second `migrate up` stops with
-`Dirty database version N. Fix and force version.` Re-running is not the recovery, because
-migrate cannot know how much of the failed file was applied.
-
-Recovery is manual. Find the dirty version with `migrate ... version`, then inspect the
-schema to see what actually landed — DSQL puts each DDL statement in its own transaction,
-so a file with several statements can be partly applied. Finish or undo the remainder by
-hand, then tell migrate where you ended up:
+Find the version, inspect what the schema has, finish or undo the remainder by hand,
+then record where you ended up:
 
 ```sh
+migrate ... version   # report the dirty version
 migrate ... force N   # set version N and clear the dirty flag, running nothing
 migrate ... up        # resume
 ```
 
-If the failed run died without releasing the lock, both of those stop with `can't acquire
-lock` — `force` takes the lock too. Add `x-force-lock=true` to the URL to delete the stale
-row, and check no other migration is running first, because it does not ask.
+Point `force` at the state the database is genuinely in. One DDL per file keeps that
+judgement trivial, which is the main reason to follow the rule.
 
-Point `force` at the state the database is genuinely in, not the one you wanted. One DDL
-per file keeps that judgement trivial, which is the main reason to follow the rule.
+A run that stopped mid-build leaves that object in the state
+[Asynchronous DDL](#asynchronous-ddl) describes, so include it:
 
-## Checking migrations before you run them
-
-[dsql-lint](https://github.com/awslabs/aurora-dsql-tools/tree/main/dsql-lint) reports the
-incompatibilities above against your migration files, including the down-migrations. It
-catches far more than this driver can, because most DSQL friction is in the content of a
-migration rather than in the tool applying it. Run it in CI:
-
-```sh
-uvx dsql-lint migrations/*.sql
-# or, after `npm install -g @aws/dsql-lint`: dsql-lint migrations/*.sql
+```sql
+SELECT relname, indisvalid FROM pg_index JOIN pg_class ON pg_class.oid = indexrelid;
+SELECT conname, convalidated FROM pg_constraint;
 ```
 
-`--fix` makes dsql-lint rewrite the SQL, which is how the Aurora DSQL ORM integrations use
-it. This driver never rewrites anything: your migration files are applied as written.
-
-It will not flag a file with several DDL statements unless the file has an explicit
-`BEGIN`/`COMMIT`, so keep the one-DDL-per-file rule in review as well.
-
-## Asynchronous DDL
-
-`CREATE INDEX ASYNC` returns as soon as the build is enqueued, so a later migration can run
-against an index that is not ready, and a failed build leaves an `INVALID` index behind that
-has to be dropped by hand. `ALTER TABLE ASYNC ... VALIDATE CONSTRAINT` behaves the same way.
-
-The driver waits for those jobs and reports which one failed, so a migration is recorded as
-applied once its index is built and its constraints are validated. Migrate clears the dirty
-flag as soon as `Run` returns, so the wait is what keeps the version history matching the
-schema. AWS recommends it for schema migrations for the same reason.
-
-The wait costs migration time on a large index build, against the 60-minute connection limit
-above, which is worth planning for on a big table.
+`force` takes the lock like any other command, so add `x-force-lock=true` when a
+previous run left a lock row behind. See [Lock](#lock).
 
 ## Usage as a library
 
@@ -209,10 +258,70 @@ if err != nil {
 m, err := migrate.NewWithDatabaseInstance("file://migrations", "dsql", driver)
 ```
 
-`WithInstance` does not resolve credentials or open connections, so a caller wanting a
-different auth or pooling setup builds the `*sql.DB` themselves.
+`WithInstance` takes the `*sql.DB` you built, so you own credentials and pooling. `Open`
+builds its own pool and closes it in `Close`.
 
-`OCCMaxRetries` is handed to the connector unchanged and counts retries rather than
-attempts, so the default of `0` runs each statement once. A URL and a `Config` literal
-resolve it identically. Mind the units on `OCCMaxRetryDelay`: it is a `time.Duration`, so
-`OCCMaxRetryDelay: 3` means three nanoseconds, not three seconds.
+`OCCMaxRetries` reaches the connector unchanged and counts retries rather than attempts,
+so `0` runs each statement once and a URL and a `Config` literal resolve alike.
+`OCCMaxRetryDelay` is a `time.Duration`, so write `3 * time.Second`.
+
+## Development
+
+Tests come in three tiers.
+
+The unit tests need nothing, and cover option parsing, async DDL classification and error
+mapping:
+
+```sh
+go test -tags dsql -skip TestPostgresStandIn ./database/dsql/
+```
+
+`TestPostgresStandIn` drives the driver against real PostgreSQL through `WithInstance`,
+the stand-in `redshift` uses for Redshift. Every statement the driver issues is plain
+PostgreSQL, so this covers the lock protocol, the version bookkeeping and `Drop`. It needs
+Docker, as the other dktest drivers do:
+
+```sh
+go test -tags dsql -run TestPostgresStandIn ./database/dsql/
+```
+
+PostgreSQL stands in for the protocol, not for compatibility — it accepts SQL that DSQL
+refuses. `sys.jobs` and `CREATE INDEX ASYNC` have no PostgreSQL equivalent, so the
+asynchronous DDL wait belongs to the third tier: a real cluster, which skips without one:
+
+```sh
+DSQL_CLUSTER_ENDPOINT=mycluster.dsql.us-east-1.on.aws \
+DSQL_TEST_SCHEMA=migrate_scratch \
+  go test -tags dsql -run TestIntegration ./database/dsql/
+```
+
+`DSQL_TEST_SCHEMA` names an existing scratch schema. `Drop` is under test and removes
+every table in the schema it runs in, and a cluster carries up to 10 schemas, so the
+tests share one and each takes its own prefixed tables inside it.
+
+## Troubleshooting
+
+**`can't acquire lock`** — a previous run holds the lock row. Confirm nothing else is
+migrating, then add `x-force-lock=true`. See [Lock](#lock).
+
+**`Dirty database version N`** — see
+[When a migration fails](#when-a-migration-fails).
+
+**Connection refused for a custom role** — check the mapping with
+`SELECT * FROM sys.iam_pg_role_mappings`, and confirm the role has `USAGE, CREATE` on
+its schema.
+
+**`password is not supported`** — the driver authenticates with an IAM token, so drop
+the password from the URL.
+
+**A migration appears to hang** — a large `CREATE INDEX ASYNC` is still building.
+`SELECT * FROM sys.jobs` reports its progress.
+
+## Resources
+
+- [Aurora DSQL docs](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/what-is-aurora-dsql.html)
+- [Concurrency control](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-concurrency-control.html)
+- [Asynchronous indexes](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-create-index-async.html)
+- [Unsupported PostgreSQL features](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-unsupported-features.html)
+- [Aurora DSQL connector for pgx](https://github.com/awslabs/aurora-dsql-connectors/tree/main/go/pgx)
+- [dsql-lint](https://github.com/awslabs/aurora-dsql-tools/tree/main/dsql-lint)

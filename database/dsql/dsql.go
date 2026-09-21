@@ -6,7 +6,7 @@
 //   - pg_advisory_lock and pg_advisory_unlock are unsupported (SQLSTATE 0A000), so the
 //     migration lock is a row in a table.
 //   - TRUNCATE is unsupported, so SetVersion clears the version table with a DELETE that
-//     has no WHERE clause. Semantics are identical: the table holds one row.
+//     has no WHERE clause.
 //
 // Separately, DSQL permits at most one DDL statement per transaction and no mixing of DDL
 // with DML. Neither postgres nor pgx wraps a migration file in an explicit transaction
@@ -34,9 +34,10 @@
 // minutes: a pinned connection would cap a migration run at an hour and would stop the
 // connector's 55-minute recycling from ever firing.
 //
-// STATUS: skeleton. The structure, option surface, connector boundary and retry placement
-// are in place for review; every method that talks to the database returns
-// errNotImplemented. Each one carries a TODO naming what it will contain and why.
+// Migrations that build an index are asynchronous on DSQL: CREATE INDEX ASYNC returns a
+// job_id once the build is enqueued. Run waits for that job before returning, so the version
+// migrate marks clean afterwards describes a schema that is actually in place. See
+// applyStatement.
 package dsql
 
 import (
@@ -46,6 +47,7 @@ import (
 	"fmt"
 	"io"
 	nurl "net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -55,6 +57,7 @@ import (
 	"github.com/awslabs/aurora-dsql-connectors/go/pgx/occretry"
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
+	"github.com/golang-migrate/migrate/v4/database/multistmt"
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -62,11 +65,12 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
-// Defaults for the configurable tables and limits.
 var (
 	DefaultMigrationsTable       = "schema_migrations"
 	DefaultLockTable             = "schema_migrations_lock"
 	DefaultMultiStatementMaxSize = 10 * 1 << 20 // 10 MB
+
+	multiStmtDelimiter = []byte(";")
 )
 
 // OCC retry defaults.
@@ -91,10 +95,29 @@ const (
 	// x-occ-max-retry-delay can express.
 	minOCCRetryDelay = time.Millisecond
 
-	// lockRetries is the retry count Lock and Unlock use in place of OCCMaxRetries. One
-	// attempt is enough for the winner's row to become visible; the rest are room for a
-	// cluster under load. See retryLock.
-	lockRetries = 10
+	// Retry floors on the driver's own statements: retryAtLeast raises OCCMaxRetries to the
+	// floor and keeps a larger setting. Each value answers to a different constraint, so each
+	// has its own name.
+	//
+	// lockRetries is one, which is what a 40001 loser needs to see the winner's row and
+	// report ErrLocked. One retry costs at most InitialWait plus jitter, keeping the acquire
+	// path inside migrate's LockTimeout of 15 seconds (migrate.go) however OCCMaxRetryDelay
+	// is set, since occConfig clamps InitialWait down to it. One is also the ceiling: the
+	// floor keeps a larger OCCMaxRetries, so around eight retries the backoff reaches that
+	// timeout, and past it m.lock() reports ErrLockTimeout while this call carries on in its
+	// goroutine, leaving a later success to write a row for x-force-lock to release.
+	//
+	// unlockRetries is ten, because the release path has no such ceiling: m.unlock() calls
+	// the driver synchronously, with no timeout goroutine racing it, so a late success cannot
+	// leave a row behind the way one on the acquire path can. Giving up early does leave one,
+	// which every later run needs x-force-lock to clear, so ten attempts is what removes it.
+	//
+	// bootstrapRetries is one, for the two CREATE TABLE IF NOT EXISTS statements newDriver
+	// issues. It is separate from lockRetries because neither races a deadline; see
+	// ensureLockTable for the concurrency it was measured against.
+	lockRetries      = 1
+	unlockRetries    = 10
+	bootstrapRetries = 1
 )
 
 var (
@@ -107,11 +130,6 @@ var (
 	// so accepting one would silently ignore the credential the operator supplied.
 	ErrPasswordSet = errors.New("dsql: password not supported, authentication uses IAM")
 )
-
-// errNotImplemented marks the parts of this skeleton still to be written. It is
-// deliberately loud: a half-working migration driver is worse than one that refuses to
-// run at all.
-var errNotImplemented = errors.New("dsql: driver skeleton, not implemented yet")
 
 func init() {
 	database.Register("dsql", &DSQL{})
@@ -130,12 +148,12 @@ type Config struct {
 	// OCC conflict retry. Classification, backoff and the meaning of these values are the
 	// connector's; occConfig hands them over unchanged.
 	//
-	// OCCMaxRetries counts retries, not attempts, so occretry.Config's zero applies here
-	// too: 0 runs a statement exactly once, and 0 is the default. Retry is opt-in, and it is
-	// worth opting in, because DSQL raises OC001 with no contention at all.
-	// Negative values are a programming error: occretry's loop body never runs, so the
-	// statement is skipped and the caller is told retries were exhausted. Both entry points
-	// hold the field to zero or more — parseConfig on the URL option, validate on a literal.
+	// OCCMaxRetries counts retries, not attempts, so occretry.Config's zero applies here too:
+	// 0 runs a statement exactly once, and 0 is the default — see DefaultOCCMaxRetries for why
+	// opting in is worth it. Negative values are a programming error: occretry's loop body
+	// never runs, so the statement is skipped and the caller is told retries were exhausted.
+	// Both entry points hold the field to zero or more — parseConfig on the URL option,
+	// validate on a literal.
 	//
 	// OCCMaxRetryDelay is a Duration, so an unsuffixed literal is nanoseconds: write
 	// 3 * time.Second, not 3. Unlike the retry count, 0 here cannot be passed through: it
@@ -145,13 +163,18 @@ type Config struct {
 	OCCMaxRetryDelay time.Duration
 
 	// An unexported field forces composite literals outside this package to be keyed, so a
-	// field can be added later without breaking callers. Zero width.
+	// field can be added later without breaking callers.
 	_ struct{}
 }
 
 type DSQL struct {
 	db       *sql.DB
 	isLocked atomic.Bool
+
+	// pool is set only by Open, which builds it. stdlib.OpenDBFromPool does not take
+	// ownership, so closing db alone would leave the pool and its connections behind; Close
+	// closes both. A WithInstance caller owns their own pool and leaves this nil.
+	pool *pgxpool.Pool
 
 	// Open and WithInstance need to guarantee that config is never nil
 	config *Config
@@ -161,6 +184,20 @@ type DSQL struct {
 // credentials nor opens connections; a caller wanting automatic IAM auth builds the pool
 // with awsdsql.NewPool and wraps it via stdlib.OpenDBFromPool.
 func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
+	// Assigned and returned separately so a failure hands back a nil interface, which is what
+	// a caller testing driver != nil reads.
+	d, err := newDriver(instance, config)
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// newDriver is WithInstance returning the concrete type, so Open can attach the pool it
+// built to the driver it gets back. WithInstance has to return database.Driver to satisfy
+// the interface other drivers expose, and a type assertion on the way back out would be a
+// silent failure waiting for someone to change this signature.
+func newDriver(instance *sql.DB, config *Config) (*DSQL, error) {
 	if config == nil {
 		return nil, ErrNilConfig
 	}
@@ -170,19 +207,61 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 
 	config.setDefaults()
 
-	// TODO: build &DSQL{db: instance, config: config}, then Ping; fill DatabaseName from
-	// CURRENT_DATABASE() and SchemaName from CURRENT_SCHEMA() when unset, returning
-	// ErrNoDatabaseName / ErrNoSchema if still empty; then ensureLockTable followed by
-	// ensureVersionTable.
-	return nil, errNotImplemented
+	if err := instance.Ping(); err != nil {
+		return nil, err
+	}
+
+	d := &DSQL{db: instance, config: config}
+
+	// CURRENT_DATABASE() and CURRENT_SCHEMA() fill what the caller left unset, as they do in
+	// the postgres and pgx drivers. On the dsql:// path a search_path in the URL has already
+	// reached the connection by now, so CURRENT_SCHEMA() resolves from it and
+	// x-migrations-schema stays an override.
+	if config.DatabaseName == "" {
+		query := `SELECT CURRENT_DATABASE()`
+		var databaseName string
+		if err := instance.QueryRow(query).Scan(&databaseName); err != nil {
+			return nil, &database.Error{OrigErr: err, Query: []byte(query)}
+		}
+		if databaseName == "" {
+			return nil, ErrNoDatabaseName
+		}
+		config.DatabaseName = databaseName
+	}
+
+	if config.SchemaName == "" {
+		query := `SELECT CURRENT_SCHEMA()`
+		// NullString so an unresolved search_path reports ErrNoSchema: CURRENT_SCHEMA() answers
+		// NULL there, which is what database/postgres scans for since #696.
+		var schemaName sql.NullString
+		if err := instance.QueryRow(query).Scan(&schemaName); err != nil {
+			return nil, &database.Error{OrigErr: err, Query: []byte(query)}
+		}
+		if !schemaName.Valid || schemaName.String == "" {
+			return nil, ErrNoSchema
+		}
+		config.SchemaName = schemaName.String
+	}
+
+	// The lock table comes first because ensureVersionTable takes the lock, which is a row
+	// in it.
+	if err := d.ensureLockTable(); err != nil {
+		return nil, err
+	}
+	if err := d.ensureVersionTable(); err != nil {
+		return nil, err
+	}
+
+	return d, nil
 }
 
-// validate holds a Config to the range parseConfig holds the matching URL options to. It
-// covers WithInstance, where the Config arrives as a literal, so both entry points agree on
-// what is acceptable.
+// validate holds a Config to the range occretry accepts. It covers WithInstance, where the
+// Config arrives as a literal rather than as URL options.
+//
+// OCCMaxRetries is the field that needs it: occretry's loop runs while attempt <= MaxRetries,
+// so a negative skips the statement and reports retries exhausted. setDefaults clamps the
+// rest, and the remaining fields report at first use.
 func (c *Config) validate() error {
-	// occretry loops while attempt <= MaxRetries, so zero or more is what describes an
-	// attempt. See OCCMaxRetries.
 	if c.OCCMaxRetries < 0 {
 		return fmt.Errorf("OCCMaxRetries must not be negative, got %d", c.OCCMaxRetries)
 	}
@@ -216,12 +295,11 @@ func (c *Config) setDefaults() {
 // MaxRetries is handed over unchanged, so the connector's semantics reach the caller
 // intact rather than being reinterpreted here.
 //
-// MaxWait cannot be, and the exception is the connector's doing: its backoff computes
-// jitter as rand.Int63n(int64(wait/4)), which panics once wait drops below 4ns, and it
-// clamps each subsequent wait to MaxWait. So a MaxWait under 4ns panics on the second
-// retry. The floor keeps that unreachable. InitialWait is lowered to match, because the
-// connector seeds the first wait from it and only clamps later ones, so a MaxWait below
-// InitialWait would otherwise be ignored on the first retry.
+// MaxWait cannot be, and the exception is the connector's doing: it clamps every subsequent
+// wait to MaxWait, so a MaxWait under the jitter floor panics on the second retry — see
+// minOCCRetryDelay. InitialWait is lowered to match, because the connector seeds the first wait
+// from it and only clamps later ones, so a MaxWait below InitialWait would otherwise be ignored
+// on the first retry.
 func (c *Config) occConfig() occretry.Config {
 	cfg := occretry.DefaultConfig()
 
@@ -263,15 +341,16 @@ func (d *DSQL) Open(rawURL string) (database.Driver, error) {
 		return nil, err
 	}
 
-	// TODO: stdlib.OpenDBFromPool does not take ownership of the pool, so Close needs a
-	// way to close it too — otherwise a pool Open created outlives the driver.
 	db := stdlib.OpenDBFromPool(pool)
-	driver, err := WithInstance(db, config)
+	driver, err := newDriver(db, config)
 	if err != nil {
 		closeErr := db.Close()
 		pool.Close()
 		return nil, errors.Join(err, closeErr)
 	}
+	// The pool is Open's to close, since Open built it. stdlib.OpenDBFromPool does not take
+	// ownership of it.
+	driver.pool = pool
 	return driver, nil
 }
 
@@ -470,75 +549,126 @@ func (d *DSQL) retry(ctx context.Context, fn func() error) error {
 	return occretry.Retry(ctx, d.config.occConfig(), fn)
 }
 
-// retryLock runs fn like retry, with a retry count of its own. The lock row is where a second
-// attempt decides whether the answer is right rather than merely faster: ErrLocked is reported
-// when the INSERT affects no rows, which a 40001 loser reaches only once the winner's row is
-// in its snapshot, and releasing the lock has to land at all, because a row left behind
-// outlives the process and every later run then fails to acquire it. DSQL raises OC001 without
-// contention, so neither can rest on OCCMaxRetries, whose default is 0. A caller who asked for
-// more than lockRetries keeps it.
+// retryAtLeast runs fn like retry, with a floor under the retry count. It covers the driver's
+// own lock and bootstrap statements, where a second attempt decides whether the answer is right
+// rather than merely faster and OCCMaxRetries defaults to 0. Each floor's reasoning is at
+// lockRetries. A caller who asked for more than the floor keeps it.
 //
 // The backoff schedule stays the caller's: MaxWait comes from OCCMaxRetryDelay, so the ceiling
-// here moves with x-occ-max-retry-delay — across the ten retries that is about 26s at the 5s
-// default and about 11ms at the 1ms floor. One knob governs every backoff in the driver.
-func (d *DSQL) retryLock(ctx context.Context, fn func() error) error {
+// here moves with x-occ-max-retry-delay. One knob governs every backoff in the driver, which is
+// also why the floor is a parameter rather than one constant.
+func (d *DSQL) retryAtLeast(ctx context.Context, retries int, fn func() error) error {
 	cfg := d.config.occConfig()
-	cfg.MaxRetries = max(cfg.MaxRetries, lockRetries)
+	cfg.MaxRetries = max(cfg.MaxRetries, retries)
 	return occretry.Retry(ctx, cfg, fn)
 }
 
+// Close releases the *sql.DB, and the pool behind it when Open built one. Closing the
+// *sql.DB does not close that pool: stdlib.OpenDBFromPool wraps it without taking
+// ownership, so a driver Open created would otherwise leave its connections open.
 func (d *DSQL) Close() error {
-	if d.db == nil {
-		return nil
+	var err error
+	if d.db != nil {
+		err = d.db.Close()
 	}
-	return d.db.Close()
+	if d.pool != nil {
+		d.pool.Close()
+	}
+	return err
 }
 
 // Lock takes the migration lock by inserting a row, because Aurora DSQL has no advisory
 // locks. The row's primary key is the arbiter, but unlike PostgreSQL the loser is not
 // always a unique violation: DSQL adjudicates conflicts at COMMIT under snapshot
 // isolation, so two migrators inserting the same key concurrently both succeed at
-// statement time and the loser commits with SQLSTATE 40001. A migrator that starts after
-// the winner has committed sees the row in its snapshot, and a bare INSERT would report that
-// one as 23505.
+// statement time and the loser commits with SQLSTATE 40001. A migrator that starts after the
+// winner has committed sees the row in its snapshot instead, which a bare INSERT would report
+// as 23505.
 //
 // So "already held" is treated as a value rather than an error: INSERT ... ON CONFLICT DO
-// NOTHING, and no rows affected means someone else holds it. The late arrival answers that
-// way on its first attempt; the concurrent loser needs a second one, by which time the
-// winner's row is in its snapshot. retryLock is what provides it, independently of
-// OCCMaxRetries, whose default of 0 would leave that loser holding a raw 40001. cockroachdb
-// takes the same line, wrapping its whole Lock in crdb.ExecuteTx.
+// NOTHING, and no rows affected means someone else holds it. That one arm answers for both
+// losers — the late arrival on its first attempt, the concurrent one on the retry lockRetries
+// provides. cockroachdb takes the same line, wrapping its whole Lock in crdb.ExecuteTx.
 //
 // A process killed while holding the lock leaves the row behind; x-force-lock lets an
 // operator delete it deliberately.
 func (d *DSQL) Lock() error {
 	return database.CasRestoreOnErr(&d.isLocked, false, true, database.ErrLocked, func() error {
-		// TODO: when config.ForceLock, DELETE the row here, outside the retried unit.
-		// Inside it, a retried attempt would re-run the DELETE and could remove a row a
-		// second migrator committed in the meantime, so both would believe they hold the
-		// lock. Force-lock clears a stale row, not a live one.
-		return d.retryLock(context.Background(), func() error {
-			// TODO: INSERT lockID() ... ON CONFLICT (lock_id) DO NOTHING, and return
-			// database.ErrLocked bare when RowsAffected is 0, so callers can match it
-			// with errors.Is. An OCC loser (40001) is retried here, and on the next
-			// attempt the winner's row is visible, so the no-rows-affected arm reports
-			// it. The ON CONFLICT clause leaves no 23505 to map: measured on a live
-			// cluster, both concurrent inserts report one row affected and the loser
-			// fails at COMMIT with 40001.
-			return errNotImplemented
+		ctx := context.Background()
+
+		lockID, err := d.lockID()
+		if err != nil {
+			return err
+		}
+
+		// Its own retried unit, separate from the INSERT below, so a retry of the INSERT runs
+		// the INSERT alone.
+		//
+		// Force-lock releases whichever row is there, stale or live, so the operator decides
+		// that no other migration is running. That is why it is opt-in, and why the README
+		// says to check first.
+		if d.config.ForceLock {
+			query := `DELETE FROM ` + d.qualifiedTable(d.config.LockTable) + ` WHERE lock_id = $1`
+			if err := d.retryAtLeast(ctx, lockRetries, func() error {
+				_, err := d.db.ExecContext(ctx, query, lockID)
+				return err
+			}); err != nil {
+				return database.Error{OrigErr: err, Err: "failed to force the migration lock", Query: []byte(query)}
+			}
+		}
+
+		// Measured on a live cluster: both concurrent inserts report one row affected and the
+		// loser fails at COMMIT with 40001, so there is no 23505 left to map.
+		query := `INSERT INTO ` + d.qualifiedTable(d.config.LockTable) + ` (lock_id) VALUES ($1) ON CONFLICT (lock_id) DO NOTHING`
+		err = d.retryAtLeast(ctx, lockRetries, func() error {
+			result, err := d.db.ExecContext(ctx, query, lockID)
+			if err != nil {
+				return err
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if affected == 0 {
+				// Bare, so callers can match it with errors.Is. Wrapping it in a
+				// database.Error would hide it: that type has no Unwrap.
+				return database.ErrLocked
+			}
+			return nil
 		})
+		if errors.Is(err, database.ErrLocked) {
+			return database.ErrLocked
+		}
+		if err != nil {
+			return database.Error{OrigErr: err, Err: "failed to take the migration lock", Query: []byte(query)}
+		}
+		return nil
 	})
 }
 
 func (d *DSQL) Unlock() error {
 	return database.CasRestoreOnErr(&d.isLocked, true, false, database.ErrNotLocked, func() error {
-		// retryLock rather than retry, for the release half of the reason given there: the
-		// row is durable, so a DELETE that gives up leaves a lock nobody holds.
-		return d.retryLock(context.Background(), func() error {
-			// TODO: DELETE the lock row by lockID(). Treat isUndefinedTable as success,
-			// because Drop removes the lock table and Migrate still calls Unlock after.
-			return errNotImplemented
+		ctx := context.Background()
+
+		lockID, err := d.lockID()
+		if err != nil {
+			return err
+		}
+
+		// unlockRetries rather than OCCMaxRetries, for the release half of the reason given
+		// at lockRetries: the row is durable, so a DELETE that gives up leaves a lock nobody
+		// holds.
+		query := `DELETE FROM ` + d.qualifiedTable(d.config.LockTable) + ` WHERE lock_id = $1`
+		err = d.retryAtLeast(ctx, unlockRetries, func() error {
+			_, err := d.db.ExecContext(ctx, query, lockID)
+			return err
 		})
+		// Drop removes the lock table and Migrate still calls Unlock afterwards, so a missing
+		// table is a released lock rather than a failure.
+		if err != nil && !isUndefinedTable(err) {
+			return database.Error{OrigErr: err, Err: "failed to release the migration lock", Query: []byte(query)}
+		}
+		return nil
 	})
 }
 
@@ -569,37 +699,47 @@ func (d *DSQL) lockID() (string, error) {
 // which DSQL requires for a file holding more than one DDL. Each piece is retried on its
 // own; what must never be replayed is a piece that already committed.
 func (d *DSQL) Run(migration io.Reader) error {
-	// TODO: read the reader and hand it to applyStatement. When !MultiStatementEnabled that
-	// is one call. When enabled, split with multistmt.Parse on ";" and call it once per
-	// piece — the piece is its own transaction, so an OCC failure committed nothing and
-	// re-running just that piece is safe. Nothing wraps the loop itself: that would replay
-	// pieces that already succeeded.
-	//
-	// Note the splitter is a plain byte search for ";" with no SQL awareness: it breaks
-	// dollar-quoted bodies, string literals and comments. Hence off by default.
-	return errNotImplemented
+	ctx := context.Background()
+
+	if d.config.MultiStatementEnabled {
+		// Nothing wraps this loop: retrying it would replay pieces that already committed.
+		// Each piece carries its own retry, inside applyStatement.
+		//
+		// The splitter is a plain byte search for ";" with no SQL awareness, so it breaks
+		// dollar-quoted bodies, string literals and comments. Hence off by default.
+		var runErr error
+		if err := multistmt.Parse(migration, multiStmtDelimiter, d.config.MultiStatementMaxSize, func(statement []byte) bool {
+			runErr = d.applyStatement(ctx, statement)
+			return runErr == nil
+		}); err != nil {
+			return err
+		}
+		return runErr
+	}
+
+	statement, err := io.ReadAll(migration)
+	if err != nil {
+		return err
+	}
+	return d.applyStatement(ctx, statement)
 }
 
 // applyStatement runs one statement to completion, which for a statement that enqueues an
 // asynchronous DDL job means waiting for the job as well.
 //
-// The retry covers the enqueue alone. Once the statement has returned a job_id the work is
-// enqueued, and re-running it costs something either way, both measured on a live cluster:
-// CREATE INDEX ASYNC reports 42P07 for the index that now exists, which is not an OCC code, so
-// it stops the migration and leaves the version dirty after the DDL succeeded, while ALTER
-// TABLE ASYNC ... VALIDATE CONSTRAINT enqueues a whole new validation job each time it is
-// re-run against a job still in flight — three re-runs, three jobs — and returns no job_id at
-// all once the constraint is valid. Waiting outside the retry is also what the engine permits:
-// CREATE INDEX ASYNC may run inside a transaction block, while CALL sys.wait_for_job answers
-// 0A000 there, because the procedure commits between polls.
+// The retry covers the enqueue alone, so each job is enqueued once. Measured on a live
+// cluster: a re-run of CREATE INDEX ASYNC reports 42P07 for the index that now exists, and a
+// re-run of ALTER TABLE ASYNC ... VALIDATE CONSTRAINT enqueues a second validation job while
+// the first is in flight. The engine wants the wait out here too — CREATE INDEX ASYNC runs
+// inside a transaction block, while CALL sys.wait_for_job answers 0A000 there.
 //
 // The wait is unconditional, so there is no setting for it: Run returns once the job is
 // finished, which is what lets the version migrate then marks clean describe the schema it
 // actually has. Run returning is migrate's signal that the migration applied — it clears the
 // dirty flag immediately afterwards, with nothing in between (migrate.go, Run then
 // SetVersion(target, false)). Waiting is also what surfaces a build that failed, while
-// sys.jobs still holds it: those rows live 30 minutes past a terminal state, and a failed
-// CREATE INDEX ASYNC leaves an INVALID index that goes on enforcing uniqueness until it is
+// sys.jobs still holds it: terminal rows survive at least 30 minutes. A failed CREATE INDEX
+// ASYNC leaves the index INVALID, and a unique one goes on enforcing uniqueness until it is
 // dropped.
 func (d *DSQL) applyStatement(ctx context.Context, statement []byte) error {
 	var jobID string
@@ -609,12 +749,74 @@ func (d *DSQL) applyStatement(ctx context.Context, statement []byte) error {
 		return runErr
 	})
 	if err != nil {
-		return err
+		return migrationError(statement, err)
 	}
 	if jobID == "" {
 		return nil
 	}
-	return d.awaitAsyncJob(ctx, jobID)
+	if err := d.awaitAsyncJob(ctx, jobID); err != nil {
+		return migrationError(statement, err)
+	}
+	return nil
+}
+
+// migrationError adds migrate's context to a failure from one statement, reporting the line
+// the server pointed at. This is where the wrapping belongs rather than inside the retried
+// unit, because database.Error has no Unwrap — see retry().
+//
+// Reporting the position matters more here than in the postgres drivers: the default path
+// sends the whole file as one statement, so pgErr.Position is file-relative.
+func migrationError(statement []byte, err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return database.Error{OrigErr: err, Err: "migration failed", Query: statement}
+	}
+
+	line, col, ok := computeLineFromPos(string(statement), int(pgErr.Position))
+	message := fmt.Sprintf("migration failed: %s", pgErr.Message)
+	if ok {
+		message = fmt.Sprintf("%s (column %d)", message, col)
+	}
+	if pgErr.Detail != "" {
+		message = fmt.Sprintf("%s, %s", message, pgErr.Detail)
+	}
+	return database.Error{OrigErr: err, Err: message, Query: statement, Line: line}
+}
+
+// Copied from database/pgx/v5/pgx.go, which shares the server's position reporting.
+func computeLineFromPos(s string, pos int) (line uint, col uint, ok bool) {
+	// replace crlf with lf
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	// pg docs: pos uses index 1 for the first character, and positions are measured in characters not bytes
+	runes := []rune(s)
+	if pos > len(runes) {
+		return 0, 0, false
+	}
+	sel := runes[:pos]
+	line = uint(runesCount(sel, newLine) + 1)
+	col = uint(pos - 1 - runesLastIndex(sel, newLine))
+	return line, col, true
+}
+
+const newLine = '\n'
+
+func runesCount(input []rune, target rune) int {
+	var count int
+	for _, r := range input {
+		if r == target {
+			count++
+		}
+	}
+	return count
+}
+
+func runesLastIndex(input []rune, target rune) int {
+	for i := len(input) - 1; i >= 0; i-- {
+		if input[i] == target {
+			return i
+		}
+	}
+	return -1
 }
 
 // runStatement executes one statement and reports the job_id of the asynchronous DDL job it
@@ -624,120 +826,335 @@ func (d *DSQL) applyStatement(ctx context.Context, statement []byte) error {
 // retry() for why. The database.Error carrying the line number belongs to whoever calls
 // retry(), applied to what retry() returns.
 func (d *DSQL) runStatement(ctx context.Context, statement []byte) (string, error) {
-	// TODO: skip blank statements; apply config.StatementTimeout via context.WithTimeout
-	// only when it is non-zero, as postgres and pgx both do. Zero is "no limit", and
-	// context.WithTimeout(ctx, 0) yields a context that has already expired.
-	//
-	// Then branch before executing, because a statement that enqueues an asynchronous job
-	// needs a different pgx call from one that does not:
-	//
-	//   - the statement returns a job_id (CREATE [UNIQUE] INDEX ... ASYNC today, and ALTER
-	//     TABLE ASYNC ... VALIDATE CONSTRAINT, which is the only way to add a validated FK
-	//     or CHECK on DSQL): QueryContext and scan the job_id row, and return it for
-	//     applyStatement to wait on. ExecContext cannot be used, because stdlib returns
-	//     driver.RowsAffected, an int64, so the row is discarded before a sql.Result exists.
-	//     Match with comments stripped first, so a comment cannot hide the keywords, and fail
-	//     loudly if a statement matched but no job_id came back rather than reporting a job
-	//     that was never waited on.
-	//   - otherwise: ExecContext, and the empty string.
-	//
-	// Return the *pgconn.PgError as-is. The caller turns it into a database.Error with the
-	// failing line, porting computeLineFromPos from database/pgx/v5/pgx.go:304-316.
-	// Reporting the position matters more here than in the postgres drivers, because the
-	// default path sends the whole file as one statement so pgErr.Position is
-	// file-relative.
-	return "", errNotImplemented
+	query := string(statement)
+	if strings.TrimSpace(query) == "" {
+		return "", nil
+	}
+
+	// Zero is "no limit", as it is in postgres and pgx, and context.WithTimeout(ctx, 0)
+	// yields a context that has already expired.
+	if d.config.StatementTimeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.config.StatementTimeout)
+		defer cancel()
+	}
+
+	// A statement that enqueues an asynchronous job needs a different call from one that does
+	// not. ExecContext cannot carry the job_id out: stdlib returns driver.RowsAffected, an
+	// int64, so the row is discarded before a sql.Result exists.
+	if enqueuesAsyncJob(query) {
+		var jobID string
+		if err := d.db.QueryRowContext(ctx, query).Scan(&jobID); err != nil {
+			// A matched statement that returns no row is a job this driver would never wait
+			// on, which is worse than a failure, so say so rather than carrying on.
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", fmt.Errorf("dsql: statement looked like asynchronous DDL but returned no job_id: %s", firstLine(query))
+			}
+			return "", err
+		}
+		return jobID, nil
+	}
+
+	if _, err := d.db.ExecContext(ctx, query); err != nil {
+		return "", err
+	}
+	return "", nil
 }
 
-// awaitAsyncJob blocks until an enqueued asynchronous DDL job finishes.
-//
-// DSQL has no synchronous form of these: CREATE INDEX ASYNC and ALTER TABLE ASYNC ...
-// VALIDATE CONSTRAINT both return a job_id as soon as the work is enqueued, so a later
-// migration step can run against an index that is not ready or a constraint that is not
-// validated, and a failed build leaves an INVALID index behind.
-//
-// applyStatement calls this outside the retry around the enqueue, and sys.jobs is
-// cluster-wide, so the job_id stays usable from whichever pooled connection the wait lands
-// on.
-func (d *DSQL) awaitAsyncJob(ctx context.Context, jobID string) error {
-	// TODO: CALL sys.wait_for_job(jobID) outside any transaction block, which the procedure
-	// requires because it commits between polls; fail the migration unless it returns true.
-	// A false is the job's own outcome and raises nothing, so read sys.jobs to report the
-	// reason: status tells failed from cancelled, and details carries the message verbatim,
-	// e.g. "found duplicate key(s) while validating index uniqueness". Terminal jobs are
-	// deleted after 30 minutes.
+var (
+	// asyncIndexPattern matches CREATE [UNIQUE] INDEX ASYNC, one of the two statements
+	// measured to hand a job_id back to the client.
+	asyncIndexPattern = regexp.MustCompile(`(?is)^CREATE\s+(UNIQUE\s+)?INDEX\s+ASYNC\b`)
+
+	// asyncValidatePattern matches ALTER TABLE ASYNC ... VALIDATE CONSTRAINT, the other one.
+	// Measured against a live cluster: it returns a job_id, and the wait then reports a CHECK
+	// that some row violates and leaves the constraint unvalidated.
 	//
-	// The procedure polls once a second until the job reaches a terminal state and has no
-	// timeout of its own. Nothing else bounds it either: Run takes no context, so ctx here is
-	// Background, and the 60-minute connection limit is the only ceiling on an index build
-	// that never finishes. Worth revisiting once there is a caller that can pass a deadline.
-	return errNotImplemented
+	// Only this spelling does. The constraint is added with a plain ALTER TABLE ... ADD
+	// CONSTRAINT ... NOT VALID, and ALTER TABLE ASYNC ... ADD CONSTRAINT and a validation
+	// without ASYNC both answer 0A000 — which is why the pattern asks for ASYNC and VALIDATE
+	// CONSTRAINT together rather than either on its own.
+	asyncValidatePattern = regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+ASYNC\b.*\bVALIDATE\s+CONSTRAINT\b`)
+)
+
+// enqueuesAsyncJob reports whether a statement returns a job_id that has to be waited on.
+//
+// Leading comments and whitespace are stripped first, so a comment cannot hide the keywords
+// from the match. Only the leading form is inspected, which is what the statement is: by the
+// time this runs, either the file is one statement or the splitter has already divided it.
+func enqueuesAsyncJob(statement string) bool {
+	statement = trimLeadingComments(statement)
+	return asyncIndexPattern.MatchString(statement) || asyncValidatePattern.MatchString(statement)
+}
+
+// trimLeadingComments removes whitespace and SQL comments from the front of a statement,
+// leaving the first keyword first. It looks only at the front, so a comment inside the
+// statement is left where it is and never confused for the statement's own text.
+func trimLeadingComments(statement string) string {
+	for {
+		statement = strings.TrimLeft(statement, " \t\r\n")
+		switch {
+		case strings.HasPrefix(statement, "--"):
+			end := strings.IndexByte(statement, '\n')
+			if end < 0 {
+				return ""
+			}
+			statement = statement[end+1:]
+		case strings.HasPrefix(statement, "/*"):
+			end := strings.Index(statement[2:], "*/")
+			if end < 0 {
+				return ""
+			}
+			statement = statement[2+end+2:]
+		default:
+			return statement
+		}
+	}
+}
+
+// firstLine names a statement in an error message without reproducing the whole file, which
+// on the default path is what a statement is.
+func firstLine(statement string) string {
+	statement = strings.TrimSpace(statement)
+	if end := strings.IndexByte(statement, '\n'); end >= 0 {
+		statement = strings.TrimSpace(statement[:end]) + " ..."
+	}
+	return statement
+}
+
+// awaitAsyncJob blocks until an enqueued asynchronous DDL job finishes. See applyStatement for
+// why the wait is unconditional and why it sits outside the retry.
+//
+// sys.jobs is cluster-wide, so the job_id stays usable from whichever pooled connection the
+// wait lands on.
+func (d *DSQL) awaitAsyncJob(ctx context.Context, jobID string) error {
+	// Called with no transaction of its own, which the procedure requires: inside one it
+	// answers 0A000.
+	//
+	// The procedure blocks until the job reaches a terminal state, and nothing here bounds it.
+	// Run takes no context, so ctx is Background; x-statement-timeout is applied in
+	// runStatement, so it covers the enqueue rather than this wait. That leaves the 60-minute
+	// connection limit as the only ceiling on an index build that never finishes. Worth
+	// revisiting once there is a caller that can pass a deadline.
+	query := `CALL sys.wait_for_job($1)`
+	var succeeded bool
+	if err := d.db.QueryRowContext(ctx, query, jobID).Scan(&succeeded); err != nil {
+		return fmt.Errorf("dsql: waiting for asynchronous DDL job %s: %w", jobID, err)
+	}
+	if succeeded {
+		return nil
+	}
+
+	// A false is the job's own outcome and raises nothing, so the reason has to be read from
+	// sys.jobs: status tells failed from canceled, and details carries the engine's own
+	// message, a duplicate-key report for a unique index build that found one. Terminal rows
+	// are pruned once they are over 30 minutes old, when the cluster next runs an asynchronous
+	// task, so a row that has aged out leaves only the job id to report.
+	var status, details sql.NullString
+	if err := d.db.QueryRowContext(ctx, `SELECT status, details FROM sys.jobs WHERE job_id = $1`, jobID).Scan(&status, &details); err != nil {
+		return fmt.Errorf("dsql: asynchronous DDL job %s did not succeed, and its status could not be read: %w", jobID, err)
+	}
+	if details.String != "" {
+		return fmt.Errorf("dsql: asynchronous DDL job %s %s: %s", jobID, status.String, details.String)
+	}
+	return fmt.Errorf("dsql: asynchronous DDL job %s %s", jobID, status.String)
 }
 
 // SetVersion records the migration version. Migrate calls this before and after every
 // migration, and Force routes through it too, so it sits on the recovery path as well as
 // the happy one.
 func (d *DSQL) SetVersion(version int, dirty bool) error {
-	// TODO: inside a single retry(), one transaction holding a DELETE of the version table
-	// with no WHERE clause followed by the INSERT of (version, dirty) — two DML statements
-	// and no DDL, which DSQL permits. TRUNCATE, which the postgres drivers use here, is
-	// unsupported. Schema-qualify both statements via qualifiedTable.
-	//
-	// The retry has to cover begin/delete/insert/commit as one unit: a pooled session can
-	// take OC001 at any of them after a schema change, and the pair is only meaningful
-	// applied together. Follow the postgres drivers in also writing the row when
-	// version == database.NilVersion && dirty, so a down migration that fails on the
-	// first migration does not leave the table empty (golang-migrate/migrate#330).
-	return errNotImplemented
+	ctx := context.Background()
+	table := d.qualifiedTable(d.config.MigrationsTable)
+
+	// A DELETE with no WHERE clause, because DSQL has no TRUNCATE. Semantics are identical:
+	// the table holds one row. Two DML statements and no DDL, which DSQL permits in one
+	// transaction.
+	deleteQuery := `DELETE FROM ` + table
+	insertQuery := `INSERT INTO ` + table + ` (version, dirty) VALUES ($1, $2)`
+
+	// One retry covers begin/delete/insert/commit as a unit: a pooled session can take OC001
+	// at any of them after a schema change, and the pair is only meaningful applied together.
+	// Each attempt begins its own transaction, so a conflict leaves nothing behind to undo.
+	var failed string
+	err := d.retry(ctx, func() error {
+		failed = ""
+		tx, err := d.db.BeginTx(ctx, &sql.TxOptions{})
+		if err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecContext(ctx, deleteQuery); err != nil {
+			failed = deleteQuery
+			return errors.Join(err, tx.Rollback())
+		}
+
+		// Also re-write the schema version for nil dirty versions to prevent
+		// empty schema version for failed down migration on the first migration
+		// See: https://github.com/golang-migrate/migrate/issues/330
+		if version >= 0 || (version == database.NilVersion && dirty) {
+			if _, err := tx.ExecContext(ctx, insertQuery, version, dirty); err != nil {
+				failed = insertQuery
+				return errors.Join(err, tx.Rollback())
+			}
+		}
+
+		return tx.Commit()
+	})
+	if err != nil {
+		return &database.Error{OrigErr: err, Query: []byte(failed)}
+	}
+	return nil
 }
 
 func (d *DSQL) Version() (version int, dirty bool, err error) {
-	// TODO: SELECT version, dirty ... LIMIT 1; report database.NilVersion for both
-	// sql.ErrNoRows and isUndefinedTable.
-	return 0, false, errNotImplemented
+	ctx := context.Background()
+	query := `SELECT version, dirty FROM ` + d.qualifiedTable(d.config.MigrationsTable) + ` LIMIT 1`
+
+	// Retried so x-occ-max-retries reaches the read the OCCMaxRetries note describes: migrate
+	// calls this one first, straight after Open has issued two DDLs, which is when a pooled
+	// session most often answers OC001 from a stale catalog.
+	//
+	// Classification stays below the retry, where database.Error can wrap the result — see
+	// retry(). occretry hands sql.ErrNoRows and an undefined table back on the first attempt,
+	// both being outside its OCC codes, so both arms still read them.
+	err = d.retry(ctx, func() error {
+		return d.db.QueryRowContext(ctx, query).Scan(&version, &dirty)
+	})
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return database.NilVersion, false, nil
+
+	case err != nil:
+		// Drop removes the version table, and migrate reads the version afterwards.
+		if isUndefinedTable(err) {
+			return database.NilVersion, false, nil
+		}
+		return 0, false, &database.Error{OrigErr: err, Query: []byte(query)}
+
+	default:
+		return version, dirty, nil
+	}
 }
 
 // Drop deletes everything in the schema.
 func (d *DSQL) Drop() error {
-	// TODO: list BASE TABLEs from information_schema for config.SchemaName, close the
-	// rows before issuing DDL, then DROP TABLE ... CASCADE each, ordering the lock table
-	// last. That keeps the lock held for the whole loop and leaves the table in place if
-	// the loop aborts part-way. On the success path the lock table is gone whichever order
-	// is used, and the Unlock that Migrate issues afterwards relies on isUndefinedTable
-	// being treated as success.
-	return errNotImplemented
+	ctx := context.Background()
+
+	// Only BASE TABLEs, and only in this driver's schema — unlike the postgres drivers, which
+	// read current_schema(). x-migrations-schema can point somewhere other than the session's
+	// schema, and dropping the wrong one would be unrecoverable.
+	query := `SELECT table_name FROM information_schema.tables WHERE table_schema = $1 AND table_type = 'BASE TABLE'`
+	rows, err := d.db.QueryContext(ctx, query, d.config.SchemaName)
+	if err != nil {
+		return &database.Error{OrigErr: err, Query: []byte(query)}
+	}
+
+	// The rows are collected and closed before any DDL runs, rather than dropping as we read:
+	// the DROPs change the catalog this query is reading.
+	tableNames := make([]string, 0)
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return errors.Join(err, rows.Close())
+		}
+		if tableName != "" {
+			tableNames = append(tableNames, tableName)
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return &database.Error{OrigErr: err, Query: []byte(query)}
+	}
+
+	// The lock table goes last, so the lock stays held for the whole loop and the table is
+	// still there if the loop aborts part-way. On the success path it is gone whichever order
+	// is used, and the Unlock that Migrate issues afterwards is what relies on a missing lock
+	// table counting as released.
+	for _, tableName := range append(withoutTable(tableNames, d.config.LockTable), lockTableIfPresent(tableNames, d.config.LockTable)...) {
+		query := `DROP TABLE IF EXISTS ` + d.qualifiedTable(tableName) + ` CASCADE`
+		if err := d.retry(ctx, func() error {
+			_, err := d.db.ExecContext(ctx, query)
+			return err
+		}); err != nil {
+			return &database.Error{OrigErr: err, Query: []byte(query)}
+		}
+	}
+
+	return nil
+}
+
+// withoutTable returns names with one entry removed, and lockTableIfPresent returns that
+// entry. Together they order the lock table last without mutating the slice Drop read from
+// the catalog.
+func withoutTable(names []string, exclude string) []string {
+	kept := make([]string, 0, len(names))
+	for _, name := range names {
+		if name != exclude {
+			kept = append(kept, name)
+		}
+	}
+	return kept
+}
+
+func lockTableIfPresent(names []string, lockTable string) []string {
+	for _, name := range names {
+		if name == lockTable {
+			return []string{lockTable}
+		}
+	}
+	return nil
 }
 
 // ensureVersionTable creates the version table. Like cockroachdb's, it takes the lock
 // itself, which deviates from the usual "caller locks" convention in this type.
-func (d *DSQL) ensureVersionTable() error {
-	// TODO: Lock(), then a deferred Unlock() whose error is joined onto the return with
-	// errors.Join. Releasing it is not optional: the lock is a durable row, so a leaked one
-	// outlives the process and every later run fails to acquire it, including the force
-	// that would clear it.
-	//
-	// Then a retried CREATE TABLE IF NOT EXISTS
-	// (version BIGINT NOT NULL PRIMARY KEY, dirty BOOLEAN NOT NULL), with no existence
-	// check, for the same reason as ensureLockTable.
-	return errNotImplemented
+func (d *DSQL) ensureVersionTable() (err error) {
+	if err := d.Lock(); err != nil {
+		return err
+	}
+	// Joined onto the return rather than discarded, because the lock is a durable row and
+	// releasing it is what leaves the next run free to take it. migrate force takes the lock
+	// like any other command, so x-force-lock is what releases a row left behind.
+	defer func() {
+		if e := d.Unlock(); e != nil {
+			err = errors.Join(err, e)
+		}
+	}()
+
+	// No existence check ahead of this, for the same reason as ensureLockTable.
+	query := `CREATE TABLE IF NOT EXISTS ` + d.qualifiedTable(d.config.MigrationsTable) +
+		` (version BIGINT NOT NULL PRIMARY KEY, dirty BOOLEAN NOT NULL)`
+	if err := d.retryAtLeast(context.Background(), bootstrapRetries, func() error {
+		_, err := d.db.ExecContext(context.Background(), query)
+		return err
+	}); err != nil {
+		return &database.Error{OrigErr: err, Query: []byte(query)}
+	}
+	return nil
 }
 
 // ensureLockTable creates the lock table. It runs before the lock exists, so it cannot be
 // lock-protected, and is written to be safe under concurrency instead.
 func (d *DSQL) ensureLockTable() error {
-	// TODO: a retried CREATE TABLE IF NOT EXISTS (lock_id TEXT NOT NULL PRIMARY KEY), with
-	// no existence check, which would reintroduce a race this does not have.
+	// CREATE TABLE IF NOT EXISTS with no existence check ahead of it, which would reintroduce
+	// the race the retry closes. PostgreSQL needs that check, IF NOT EXISTS having a genuine
+	// non-transactional window there; DSQL's catalog is transactional under OCC, so a losing
+	// concurrent creation surfaces as a conflict at commit rather than a duplicate-table error.
+	// Measured against a live cluster: 144 concurrent CREATE TABLE IF NOT EXISTS at up to
+	// 24-way concurrency produced only SQLSTATE 40001 and never 42P07.
 	//
-	// That closes the race here, unlike in PostgreSQL where IF NOT EXISTS has a genuine
-	// non-transactional window. DSQL's catalog is transactional under OCC, so a losing
-	// concurrent creation surfaces as a conflict at commit rather than a duplicate-table
-	// error, and retry() handles it. Measured against a live cluster: 144 concurrent
-	// CREATE TABLE IF NOT EXISTS at up to 24-way concurrency produced only SQLSTATE 40001
-	// and never 42P07.
-	return errNotImplemented
+	// The floor is bootstrapRetries rather than OCCMaxRetries because this runs before the
+	// caller's opt-in setting can protect anything.
+	query := `CREATE TABLE IF NOT EXISTS ` + d.qualifiedTable(d.config.LockTable) +
+		` (lock_id TEXT NOT NULL PRIMARY KEY)`
+	if err := d.retryAtLeast(context.Background(), bootstrapRetries, func() error {
+		_, err := d.db.ExecContext(context.Background(), query)
+		return err
+	}); err != nil {
+		return &database.Error{OrigErr: err, Query: []byte(query)}
+	}
+	return nil
 }
 
-// qualifiedTable renders a schema-qualified, quoted table name.
 func (d *DSQL) qualifiedTable(table string) string {
 	return quoteIdentifier(d.config.SchemaName) + "." + quoteIdentifier(table)
 }
